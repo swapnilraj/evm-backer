@@ -1,0 +1,28 @@
+# Rust
+target/
+Cargo.lock.bak
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Foundry
+contracts/out/
+contracts/cache/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo

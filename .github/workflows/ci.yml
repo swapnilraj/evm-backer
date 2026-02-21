@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Contract tests — forge build + forge test
+  # -------------------------------------------------------------------------
+  contract-tests:
+    name: Contract Tests (Foundry)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Cache forge artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            contracts/out
+            contracts/cache
+          key: forge-${{ hashFiles('contracts/src/**', 'contracts/lib/**', 'contracts/foundry.toml') }}
+          restore-keys: forge-
+
+      - name: Build
+        run: forge build
+        working-directory: contracts
+
+      - name: Test
+        run: forge test -v
+        working-directory: contracts
+
+  # -------------------------------------------------------------------------
+  # Python tests — pytest against a live anvil node
+  # Requires Foundry (forge build for ABI artifacts, anvil for the test node)
+  # The real Groth16 test (test_zk_real.py) is excluded — it requires ~8 GB
+  # of SP1 circuit artifacts and takes ~7 minutes; run locally with
+  # REAL_SP1_PROOF=1 pytest tests/test_zk_real.py
+  # -------------------------------------------------------------------------
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Cache forge artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            contracts/out
+            contracts/cache
+          key: forge-${{ hashFiles('contracts/src/**', 'contracts/lib/**', 'contracts/foundry.toml') }}
+          restore-keys: forge-
+
+      - name: Build contracts
+        run: forge build
+        working-directory: contracts
+
+      - name: Run tests
+        run: uv run pytest tests/ -q --tb=short --ignore=tests/test_zk_real.py

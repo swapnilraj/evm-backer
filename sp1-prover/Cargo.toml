@@ -1,0 +1,16 @@
+[package]
+name = "sp1-prover"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sp1-prover"
+path = "src/main.rs"
+
+[dependencies]
+sp1-sdk = { version = "6.0.0", features = ["blocking", "native-gnark"] }
+hex = "0.4"
+serde_json = "1"
+
+[build-dependencies]
+sp1-build = { version = "6.0.0" }
