@@ -12,12 +12,12 @@ Commands:
 """
 
 import argparse
-import json
 import logging
 import sys
 
+from eth_account import Account
+
 from evm_backer.service import (
-    build_service,
     load_config,
     load_contract_abi,
     run_service,
@@ -40,23 +40,22 @@ def cmd_info(args):
     """Show backer AID prefix, Ethereum address, and configuration."""
     config = load_config()
     hby, hab = setup_backer_hab(config)
+    try:
+        eth_address = ""
+        if config["ETH_PRIVATE_KEY"]:
+            account = Account.from_key(config["ETH_PRIVATE_KEY"])
+            eth_address = account.address
 
-    eth_address = ""
-    if config["ETH_PRIVATE_KEY"]:
-        from eth_account import Account
-        account = Account.from_key(config["ETH_PRIVATE_KEY"])
-        eth_address = account.address
-
-    print(f"Backer AID:        {hab.pre}")
-    print(f"Ethereum address:  {eth_address or '(no ETH_PRIVATE_KEY set)'}")
-    print(f"Contract address:  {config['ETH_CONTRACT_ADDRESS'] or '(not set)'}")
-    print(f"Chain ID:          {config['ETH_CHAIN_ID']}")
-    print(f"RPC URL:           {config['ETH_RPC_URL']}")
-    print(f"HTTP port:         {config['BACKER_PORT']}")
-    print(f"Queue duration:    {config['QUEUE_DURATION']}s")
-    print(f"Batch size:        {config['BATCH_SIZE']}")
-
-    hby.close()
+        print(f"Backer AID:        {hab.pre}")
+        print(f"Ethereum address:  {eth_address or '(no ETH_PRIVATE_KEY set)'}")
+        print(f"Contract address:  {config['ETH_CONTRACT_ADDRESS'] or '(not set)'}")
+        print(f"Chain ID:          {config['ETH_CHAIN_ID']}")
+        print(f"RPC URL:           {config['ETH_RPC_URL']}")
+        print(f"HTTP port:         {config['BACKER_PORT']}")
+        print(f"Queue duration:    {config['QUEUE_DURATION']}s")
+        print(f"Batch size:        {config['BATCH_SIZE']}")
+    finally:
+        hby.close()
 
 
 def cmd_query(args):
@@ -67,7 +66,7 @@ def cmd_query(args):
         print("Error: ETH_CONTRACT_ADDRESS not set", file=sys.stderr)
         sys.exit(1)
 
-    w3 = setup_web3(config)
+    w3, _ = setup_web3(config)
     abi = load_contract_abi()
     contract = w3.eth.contract(
         address=config["ETH_CONTRACT_ADDRESS"],
@@ -77,9 +76,6 @@ def cmd_query(args):
     prefix_b32 = prefix_to_bytes32(args.prefix)
     sn = args.sn
 
-    # Query all SAIDs is not possible without knowing the SAID,
-    # so we query isAnchored if --said is provided, otherwise
-    # just print the prefix hash for reference
     if args.said:
         said_b32 = said_to_bytes32(args.said)
         result = contract.functions.isAnchored(prefix_b32, sn, said_b32).call()

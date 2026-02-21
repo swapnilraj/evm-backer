@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 CONFIRMATION_DEPTH = 12  # blocks required to consider an anchor confirmed
-TIMEOUT_DEPTH = 32       # blocks after which unconfirmed tx is requeued
+TIMEOUT_DEPTH = 32       # blocks after which an unmined tx is abandoned
 
 
 class PendingAnchor:
@@ -33,89 +33,73 @@ class PendingAnchor:
         self.events = events  # list of (prefix_qb64, sn, said_qb64)
 
 
+class _UnconfirmedTx:
+    """A submitted transaction that has not yet been mined."""
+
+    __slots__ = ("tx_hash", "events", "submitted_block")
+
+    def __init__(self, tx_hash, events, submitted_block):
+        self.tx_hash = tx_hash
+        self.events = events
+        self.submitted_block = submitted_block
+
+
 class Crawler:
     """Monitors anchoring transactions for confirmation and reorgs.
 
-    The Crawler checks pending transactions against the chain:
-    1. If current_block - anchor_block >= CONFIRMATION_DEPTH and block hash
-       matches, the events are confirmed.
-    2. If the block hash at anchor_block has changed, a reorg occurred —
-       events are requeued.
-    3. If current_block - anchor_block >= TIMEOUT_DEPTH and the tx was
-       never mined, events are requeued.
-    4. If the transaction receipt shows status == 0 (reverted), events
-       are requeued immediately.
-    5. If the RPC is unreachable, the check cycle is skipped without
-       advancing timeout counters.
+    The Crawler operates in two phases per check() cycle:
+
+    Phase 1 — Resolve unconfirmed: for each submitted tx whose receipt has
+    not yet been fetched, attempt to get the receipt. If mined successfully,
+    promote to the pending list. If reverted or timed out (TIMEOUT_DEPTH
+    blocks since submission with no receipt), requeue the events.
+
+    Phase 2 — Confirm pending: for each mined tx, check whether its block
+    is still canonical at CONFIRMATION_DEPTH. If the block hash at
+    anchor.block_number still matches, mark confirmed. If the hash has
+    changed (reorg), requeue the events.
+
+    track() is non-blocking — it only records the tx for polling in check().
+    All RPC calls are deferred to check(), so a slow node never stalls the
+    flush cycle.
     """
 
     def __init__(self, w3, queuer):
         self.w3 = w3
         self.queuer = queuer
-        self._pending = []  # list of PendingAnchor
+        self._unconfirmed = []  # list of _UnconfirmedTx
+        self._pending = []      # list of PendingAnchor (mined, awaiting confirmation)
         self._confirmed_count = 0
 
     def track(self, tx_hash, events):
         """Start tracking a submitted transaction.
 
-        Fetches the transaction receipt to get the block number and hash.
-        If the receipt shows the tx reverted (status == 0), requeues
-        the events immediately.
+        Non-blocking: records the tx for polling in check(). The receipt is
+        fetched lazily so callers do not stall waiting for the tx to be mined.
 
         Args:
             tx_hash: Transaction hash (hex string).
             events: list of (prefix_qb64, sn, said_qb64) tuples.
         """
         try:
-            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            submitted_block = self.w3.eth.block_number
         except Exception:
-            logger.warning(
-                "Failed to fetch receipt for %s, requeuing events", tx_hash
-            )
-            self.queuer.requeue(events)
-            return
-
-        if receipt is None:
-            logger.warning("Receipt is None for %s, requeuing events", tx_hash)
-            self.queuer.requeue(events)
-            return
-
-        if receipt.status == 0:
-            logger.warning(
-                "Transaction %s reverted (status=0), requeuing %d events",
-                tx_hash,
-                len(events),
-            )
-            self.queuer.requeue(events)
-            return
-
-        if receipt.status != 1:
-            logger.warning(
-                "Transaction %s has unexpected status %d, requeuing events",
-                tx_hash,
-                receipt.status,
-            )
-            self.queuer.requeue(events)
-            return
-
-        block = self.w3.eth.get_block(receipt.blockNumber)
-        pending = PendingAnchor(
-            tx_hash=tx_hash,
-            block_number=receipt.blockNumber,
-            block_hash=block.hash,
-            events=events,
-        )
-        self._pending.append(pending)
+            submitted_block = 0
+        self._unconfirmed.append(_UnconfirmedTx(tx_hash, events, submitted_block))
 
     def check(self):
-        """Check all pending anchors for confirmation, reorg, or timeout.
+        """Check all tracked transactions for mining, confirmation, and reorgs.
+
+        Phase 1: Resolve unconfirmed transactions (fetch receipts).
+        Phase 2: Check pending (mined) transactions for confirmation / reorg.
 
         If the RPC is unreachable, the check cycle is skipped entirely —
-        pending anchors are not modified and timeout counters do not advance.
+        no state is modified and timeout counters do not advance.
 
         Returns:
-            A tuple of (confirmed, reorged) lists.
-            Each list contains PendingAnchor instances.
+            A tuple of (confirmed, reorged) lists of PendingAnchor instances.
+            Timed-out and reverted transactions appear in reorged so that
+            callers can call clear_pending_tx on them.
             Returns ([], []) if the RPC is unreachable.
         """
         try:
@@ -123,31 +107,96 @@ class Crawler:
         except Exception:
             logger.warning(
                 "RPC unreachable during check(), skipping cycle "
-                "(%d pending anchors unchanged)",
+                "(%d unconfirmed, %d pending)",
+                len(self._unconfirmed),
                 len(self._pending),
             )
             return [], []
 
         confirmed = []
         reorged = []
-        timed_out = []
-        still_pending = []
 
+        # ------------------------------------------------------------------
+        # Phase 1: resolve unconfirmed transactions
+        # ------------------------------------------------------------------
+        still_unconfirmed = []
+        for utx in self._unconfirmed:
+            depth = current_block - utx.submitted_block
+
+            if depth >= TIMEOUT_DEPTH:
+                logger.warning(
+                    "Transaction %s never mined after %d blocks, requeuing %d events",
+                    utx.tx_hash, depth, len(utx.events),
+                )
+                self.queuer.requeue(utx.events)
+                # Include in reorged so the caller invokes clear_pending_tx.
+                reorged.append(PendingAnchor(
+                    tx_hash=utx.tx_hash,
+                    block_number=0,
+                    block_hash=b"",
+                    events=utx.events,
+                ))
+                continue
+
+            try:
+                receipt = self.w3.eth.get_transaction_receipt(utx.tx_hash)
+            except Exception:
+                still_unconfirmed.append(utx)
+                continue
+
+            if receipt is None:
+                still_unconfirmed.append(utx)
+                continue
+
+            if receipt.status == 0:
+                logger.warning(
+                    "Transaction %s reverted (status=0), requeuing %d events",
+                    utx.tx_hash, len(utx.events),
+                )
+                self.queuer.requeue(utx.events)
+                reorged.append(PendingAnchor(
+                    tx_hash=utx.tx_hash,
+                    block_number=receipt.blockNumber,
+                    block_hash=b"",
+                    events=utx.events,
+                ))
+                continue
+
+            if receipt.status != 1:
+                logger.warning(
+                    "Transaction %s has unexpected status %d, requeuing events",
+                    utx.tx_hash, receipt.status,
+                )
+                self.queuer.requeue(utx.events)
+                reorged.append(PendingAnchor(
+                    tx_hash=utx.tx_hash,
+                    block_number=receipt.blockNumber,
+                    block_hash=b"",
+                    events=utx.events,
+                ))
+                continue
+
+            try:
+                block = self.w3.eth.get_block(receipt.blockNumber)
+            except Exception:
+                still_unconfirmed.append(utx)
+                continue
+
+            self._pending.append(PendingAnchor(
+                tx_hash=utx.tx_hash,
+                block_number=receipt.blockNumber,
+                block_hash=block.hash,
+                events=utx.events,
+            ))
+
+        self._unconfirmed = still_unconfirmed
+
+        # ------------------------------------------------------------------
+        # Phase 2: check pending (mined) transactions for confirmation / reorg
+        # ------------------------------------------------------------------
+        still_pending = []
         for anchor in self._pending:
             depth = current_block - anchor.block_number
-
-            # Timeout: tx was mined too long ago without confirmation,
-            # or was never included and block height has moved far past
-            if depth >= TIMEOUT_DEPTH:
-                timed_out.append(anchor)
-                self.queuer.requeue(anchor.events)
-                logger.warning(
-                    "Anchor %s timed out at depth %d, requeuing %d events",
-                    anchor.tx_hash,
-                    depth,
-                    len(anchor.events),
-                )
-                continue
 
             if depth < CONFIRMATION_DEPTH:
                 still_pending.append(anchor)
@@ -158,8 +207,7 @@ class Crawler:
             except Exception:
                 logger.warning(
                     "Failed to fetch block %d for anchor %s, keeping pending",
-                    anchor.block_number,
-                    anchor.tx_hash,
+                    anchor.block_number, anchor.tx_hash,
                 )
                 still_pending.append(anchor)
                 continue
@@ -170,14 +218,18 @@ class Crawler:
             else:
                 reorged.append(anchor)
                 self.queuer.requeue(anchor.events)
+                logger.warning(
+                    "Anchor %s reorged at depth %d, requeuing %d events",
+                    anchor.tx_hash, depth, len(anchor.events),
+                )
 
         self._pending = still_pending
         return confirmed, reorged
 
     @property
     def pending_count(self):
-        """Number of pending (unconfirmed) anchors."""
-        return len(self._pending)
+        """Number of pending (unconfirmed or awaiting confirmation) anchors."""
+        return len(self._unconfirmed) + len(self._pending)
 
     @property
     def confirmed_count(self):

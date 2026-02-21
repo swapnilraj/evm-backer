@@ -135,6 +135,8 @@ def process_event(hab, parser, kevery_components, queuer, raw_msg):
     parser.parse(ims=bytearray(raw_msg), kvy=kevery)
 
     # Inspect accepted events from cues before processCues consumes them.
+    # hio.Deck.__iter__ is non-consuming (peek semantics), so iterating here
+    # does not prevent processCues from seeing the same cues below.
     # Each "receipt" cue means Kevery accepted and stored the event.
     for cue in kevery.cues:
         if cue.get("kin") != "receipt":

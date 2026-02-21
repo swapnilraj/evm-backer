@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 from eth_account import Account
 from keri.app import habbing
@@ -29,6 +30,7 @@ from evm_backer.backer import setup_kevery, setup_parser, setup_tevery
 from evm_backer.crawler import Crawler
 from evm_backer.event_queue import Queuer
 from evm_backer.http_server import create_app
+from evm_backer.rpc import MultiRPCProvider
 
 logger = logging.getLogger("evm_backer")
 
@@ -74,11 +76,9 @@ def load_contract_abi(abi_path=None):
         The ABI as a list of dicts.
     """
     if abi_path is None:
-        project_root = os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        )
-        abi_path = os.path.join(
-            project_root, "contracts", "out", "KERIBacker.sol", "KERIBacker.json"
+        project_root = Path(__file__).parent.parent.parent
+        abi_path = (
+            project_root / "contracts" / "out" / "KERIBacker.sol" / "KERIBacker.json"
         )
     with open(abi_path) as f:
         artifact = json.load(f)
@@ -86,20 +86,33 @@ def load_contract_abi(abi_path=None):
 
 
 def setup_web3(config):
-    """Create a Web3 instance connected to the configured RPC endpoint.
+    """Create a Web3 instance connected to the configured RPC endpoint(s).
+
+    Supports comma-separated URLs for multi-RPC failover via MultiRPCProvider.
+    When multiple URLs are given, the primary endpoint is used initially;
+    call rpc_provider.report_failure() / rpc_provider.get_web3() to rotate
+    on failure.
 
     Args:
         config: dict from load_config().
 
     Returns:
-        A connected Web3 instance.
+        A tuple of (w3, rpc_provider) where rpc_provider is None for
+        single-URL configurations.
     """
-    w3 = Web3(Web3.HTTPProvider(config["ETH_RPC_URL"]))
+    urls = [u.strip() for u in config["ETH_RPC_URL"].split(",") if u.strip()]
+    if len(urls) > 1:
+        rpc_provider = MultiRPCProvider(urls)
+        w3 = rpc_provider.get_web3()
+    else:
+        rpc_provider = None
+        w3 = Web3(Web3.HTTPProvider(urls[0]))
+
     if not w3.is_connected():
         raise ConnectionError(
             f"Cannot connect to Ethereum node at {config['ETH_RPC_URL']}"
         )
-    return w3
+    return w3, rpc_provider
 
 
 def setup_backer_hab(config):
@@ -125,23 +138,23 @@ def setup_backer_hab(config):
 
 
 def setup_ethereum(config, abi_path=None):
-    """Set up Ethereum components: Web3, contract, and backer account.
+    """Set up Ethereum components: Web3, contract, backer account, and RPC provider.
 
     Args:
         config: dict from load_config().
         abi_path: Optional path to contract ABI artifact.
 
     Returns:
-        tuple of (w3, contract, backer_account).
+        tuple of (w3, contract, backer_account, rpc_provider).
     """
-    w3 = setup_web3(config)
+    w3, rpc_provider = setup_web3(config)
     abi = load_contract_abi(abi_path)
     contract = w3.eth.contract(
         address=config["ETH_CONTRACT_ADDRESS"],
         abi=abi,
     )
     backer_account = Account.from_key(config["ETH_PRIVATE_KEY"])
-    return w3, contract, backer_account
+    return w3, contract, backer_account, rpc_provider
 
 
 def build_service(config=None, abi_path=None):
@@ -152,19 +165,33 @@ def build_service(config=None, abi_path=None):
         abi_path: Optional path to contract ABI artifact.
 
     Returns:
-        dict with keys: app, hab, hby, queuer, crawler, config, w3
+        dict with keys: app, hab, hby, queuer, crawler, config, w3, rpc_provider
     """
     if config is None:
         config = load_config()
 
     hby, hab = setup_backer_hab(config)
-    w3, contract, backer_account = setup_ethereum(config, abi_path)
+    w3, contract, backer_account, rpc_provider = setup_ethereum(config, abi_path)
 
     kevery_components = setup_kevery(hby)
     tevery_components = setup_tevery(hby, hab, kevery_components)
     parser = setup_parser(kevery_components, tevery_components)
 
-    queuer = Queuer(w3=w3, contract=contract, backer_account=backer_account)
+    # Derive the Ed25519 signing callable from the backer's KERI key.
+    # hab.sign(ser, indexed=False) returns a list of Cigar objects;
+    # Cigar.raw is the 64-byte Ed25519 signature over the raw bytes.
+    # This uses the same key as the backer's KERI identity, as required
+    # by the spec (one key for both KERI and Ethereum authorization).
+    def _sign_with_hab(msg):
+        sigs = hab.sign(ser=msg, indexed=False)
+        return sigs[0].raw
+
+    queuer = Queuer(
+        w3=w3,
+        contract=contract,
+        backer_account=backer_account,
+        signing_key=_sign_with_hab,
+    )
     crawler = Crawler(w3=w3, queuer=queuer)
 
     app = create_app(hab, parser, kevery_components, queuer)
@@ -177,6 +204,7 @@ def build_service(config=None, abi_path=None):
         "crawler": crawler,
         "config": config,
         "w3": w3,
+        "rpc_provider": rpc_provider,
     }
 
 

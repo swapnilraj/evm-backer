@@ -361,24 +361,14 @@ def deployer_account(w3):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def mock_sp1_verifier(w3, anvil_process):
+def mock_sp1_verifier(w3, deployed_contract):
     """Deploy SP1MockVerifier to anvil and return its address.
 
     SP1MockVerifier accepts any verifyProof() call where proofBytes.length == 0.
     This allows ZK path tests to run without the real SP1 toolchain.
-    """
-    # Build must have already run via deployed_contract; run again for safety.
-    compile_result = subprocess.run(
-        ["forge", "build", "--root", CONTRACTS_DIR],
-        capture_output=True,
-        text=True,
-    )
-    if compile_result.returncode != 0:
-        pytest.fail(
-            f"forge build failed:\nstdout: {compile_result.stdout}\n"
-            f"stderr: {compile_result.stderr}"
-        )
 
+    Depends on deployed_contract to ensure forge build has already run.
+    """
     deploy_result = subprocess.run(
         [
             "forge", "create",

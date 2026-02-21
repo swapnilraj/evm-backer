@@ -54,7 +54,7 @@ def estimate_eip1559_fees(w3):
     try:
         latest = w3.eth.get_block("latest")
         base_fee = latest["baseFeePerGas"]
-    except (KeyError, Exception):
+    except Exception:
         return None
 
     try:
@@ -75,13 +75,18 @@ def ed25519_sign(signing_key, message):
     """Sign a message with an Ed25519 key.
 
     Args:
-        signing_key: nacl.signing.SigningKey instance.
+        signing_key: Either a nacl.signing.SigningKey, or any callable that
+                     accepts bytes and returns a 64-byte signature. The
+                     callable form is used in production to delegate signing
+                     to the backer's keripy key manager.
         message: bytes to sign.
 
     Returns:
         64-byte Ed25519 signature (r || s).
     """
-    return signing_key.sign(message).signature
+    if hasattr(signing_key, "sign"):
+        return signing_key.sign(message).signature
+    return signing_key(message)
 
 
 def build_anchor_tx(w3, contract, backer_account, anchors, signing_key=None):

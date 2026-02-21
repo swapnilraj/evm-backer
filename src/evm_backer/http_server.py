@@ -15,12 +15,9 @@ Reference:
   - docs/05-keri-backers.md (witness HTTP interface)
 """
 
-import concurrent.futures
 import falcon
 
 from evm_backer.backer import process_event
-
-PARSE_TIMEOUT = 10  # seconds to allow for event processing
 
 
 class EventResource:
@@ -45,21 +42,9 @@ class EventResource:
             return
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    process_event,
-                    self.hab,
-                    self.parser,
-                    self.kevery_components,
-                    self.queuer,
-                    raw_msg,
-                )
-                receipt = future.result(timeout=PARSE_TIMEOUT)
-        except concurrent.futures.TimeoutError:
-            resp.status = falcon.HTTP_422
-            resp.content_type = falcon.MEDIA_TEXT
-            resp.text = "Event processing timed out"
-            return
+            receipt = process_event(
+                self.hab, self.parser, self.kevery_components, self.queuer, raw_msg
+            )
         except Exception as exc:
             resp.status = falcon.HTTP_422
             resp.content_type = falcon.MEDIA_TEXT
@@ -68,10 +53,7 @@ class EventResource:
 
         resp.status = falcon.HTTP_200
         resp.content_type = "application/cesr"
-        if receipt:
-            resp.data = bytes(receipt) if not isinstance(receipt, bytes) else receipt
-        else:
-            resp.data = b""
+        resp.data = receipt if receipt else b""
 
 
 class HealthResource:

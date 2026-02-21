@@ -346,16 +346,26 @@ class TestCrawlerRevertDetection:
         events = [("prefix", 0, "said")]
         crawler.track(receipt.transactionHash.hex(), events)
 
-        assert crawler.pending_count == 0, "Reverted tx should not be tracked"
-        assert requeued == events, "Events should be requeued after revert"
+        # track() is non-blocking — receipt is fetched lazily in check().
+        # After track(), the tx is in the unconfirmed list.
+        assert crawler.pending_count == 1, "Tx should be in unconfirmed list"
+        assert requeued == [], "Events should not be requeued before check()"
 
-    def test_track_with_rpc_failure_requeues(self):
-        """If get_transaction_receipt throws, events should be requeued."""
+        # check() fetches the receipt, detects status==0, and requeues.
+        _, reorged = crawler.check()
+        assert crawler.pending_count == 0, "Reverted tx should be removed after check()"
+        assert requeued == events, "Events should be requeued after check() detects revert"
+
+    def test_track_with_rpc_failure_retries_next_cycle(self):
+        """If get_transaction_receipt throws during check(), the tx stays in
+        the unconfirmed list and is retried in the next cycle rather than
+        being requeued immediately.
+        """
         from evm_backer.crawler import Crawler
-        from unittest.mock import MagicMock
+        from unittest.mock import MagicMock, PropertyMock
 
-        # Create a mock w3 that raises on get_transaction_receipt
         mock_w3 = MagicMock()
+        type(mock_w3.eth).block_number = PropertyMock(return_value=100)
         mock_w3.eth.get_transaction_receipt.side_effect = ConnectionError("RPC down")
 
         requeued = []
@@ -368,8 +378,10 @@ class TestCrawlerRevertDetection:
         events = [("prefix", 0, "said")]
         crawler.track("0x" + "ab" * 32, events)
 
-        assert crawler.pending_count == 0
-        assert requeued == events
+        # First check: receipt fetch fails, tx remains in unconfirmed
+        _, reorged = crawler.check()
+        assert crawler.pending_count == 1, "Tx should remain in unconfirmed on RPC failure"
+        assert requeued == [], "Events should not be requeued on transient RPC failure"
 
 
 class TestCrawlerRPCResilience:

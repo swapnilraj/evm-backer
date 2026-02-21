@@ -7,13 +7,45 @@ import {KERIBacker} from "../src/KERIBacker.sol";
 import {Ed25519} from "../src/Ed25519.sol";
 import {SP1MockVerifier} from "@sp1-contracts/SP1MockVerifier.sol";
 
-contract KERIBackerTest is Test {
-    KERIBacker public kb;
+// =============================================================================
+// Shared base: FFI signing helpers and the common Ed25519 test key
+// =============================================================================
 
+abstract contract KERIBackerTestBase is Test {
     // Ed25519 test key pair (RFC 8032 test vector 3)
     // seed: c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7
     // pubkey: fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025
-    bytes32 public constant BACKER_PUBKEY = 0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025;
+    bytes32 public constant BACKER_PUBKEY =
+        0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025;
+
+    /// @dev Sign a message with the test Ed25519 key via Python FFI.
+    ///      The Python script outputs "0x" + hex(signature), which forge
+    ///      decodes into raw bytes automatically.
+    function _sign(bytes memory message) internal returns (bytes memory) {
+        string[] memory cmd = new string[](3);
+        cmd[0] = "python3";
+        cmd[1] = "test/sign_ed25519.py";
+        cmd[2] = _toHex(message);
+        return vm.ffi(cmd);
+    }
+
+    function _toHex(bytes memory data) internal pure returns (string memory) {
+        bytes memory hexChars = "0123456789abcdef";
+        bytes memory result = new bytes(data.length * 2);
+        for (uint256 i = 0; i < data.length; i++) {
+            result[i * 2]     = hexChars[uint8(data[i]) >> 4];
+            result[i * 2 + 1] = hexChars[uint8(data[i]) & 0x0f];
+        }
+        return string(result);
+    }
+}
+
+// =============================================================================
+// Standard path tests (Ed25519 on-chain verification)
+// =============================================================================
+
+contract KERIBackerTest is KERIBackerTestBase {
+    KERIBacker public kb;
 
     bytes32 public prefix1 = keccak256("AID_prefix_1");
     bytes32 public prefix2 = keccak256("AID_prefix_2");
@@ -41,31 +73,6 @@ contract KERIBackerTest is Test {
 
     function setUp() public {
         kb = new KERIBacker(BACKER_PUBKEY);
-    }
-
-    // =========================================================================
-    // FFI signing helper
-    // =========================================================================
-
-    /// @dev Sign a message with the test Ed25519 key via Python FFI.
-    ///      The Python script outputs "0x" + hex(signature), which forge
-    ///      decodes into raw bytes automatically.
-    function _sign(bytes memory message) internal returns (bytes memory) {
-        string[] memory cmd = new string[](3);
-        cmd[0] = "python3";
-        cmd[1] = "test/sign_ed25519.py";
-        cmd[2] = _toHex(message);
-        return vm.ffi(cmd);
-    }
-
-    function _toHex(bytes memory data) internal pure returns (string memory) {
-        bytes memory hexChars = "0123456789abcdef";
-        bytes memory result = new bytes(data.length * 2);
-        for (uint256 i = 0; i < data.length; i++) {
-            result[i * 2] = hexChars[uint8(data[i]) >> 4];
-            result[i * 2 + 1] = hexChars[uint8(data[i]) & 0x0f];
-        }
-        return string(result);
     }
 
     // =========================================================================
@@ -239,6 +246,8 @@ contract KERIBackerTest is Test {
         bytes32 msgHash = keccak256(abi.encode(anchors));
         bytes memory sig = _sign(abi.encodePacked(msgHash));
         kb.anchorBatch(anchors, sig);
+        // Empty batch with valid signature should succeed without anchoring anything
+        assertFalse(kb.isAnchored(prefix1, 0, said1));
     }
 
     function test_anchorBatch_handlesDuplicityInBatch() public {
@@ -383,12 +392,9 @@ contract KERIBackerTest is Test {
 // SP1 ZK Proof tests
 // =============================================================================
 
-contract KERIBackerZKTest is Test {
+contract KERIBackerZKTest is KERIBackerTestBase {
     KERIBacker public kb;
     SP1MockVerifier public mockSP1;
-
-    // Ed25519 test key pair (RFC 8032 test vector 3)
-    bytes32 public constant BACKER_PUBKEY = 0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025;
 
     bytes32 public prefix1 = keccak256("AID_prefix_1");
     bytes32 public said1   = keccak256("event_said_1");
@@ -404,28 +410,6 @@ contract KERIBackerZKTest is Test {
         bytes32 msgHash = keccak256(abi.encodePacked(address(mockSP1), bytes32(0), nonce));
         bytes memory sig = _sign(abi.encodePacked(msgHash));
         kb.setZKVerifier(address(mockSP1), bytes32(0), sig, nonce);
-    }
-
-    // -------------------------------------------------------------------------
-    // FFI signing helper (same as KERIBackerTest)
-    // -------------------------------------------------------------------------
-
-    function _sign(bytes memory message) internal returns (bytes memory) {
-        string[] memory cmd = new string[](3);
-        cmd[0] = "python3";
-        cmd[1] = "test/sign_ed25519.py";
-        cmd[2] = _toHex(message);
-        return vm.ffi(cmd);
-    }
-
-    function _toHex(bytes memory data) internal pure returns (string memory) {
-        bytes memory hexChars = "0123456789abcdef";
-        bytes memory result = new bytes(data.length * 2);
-        for (uint256 i = 0; i < data.length; i++) {
-            result[i * 2]     = hexChars[uint8(data[i]) >> 4];
-            result[i * 2 + 1] = hexChars[uint8(data[i]) & 0x0f];
-        }
-        return string(result);
     }
 
     // =========================================================================
