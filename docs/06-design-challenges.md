@@ -160,28 +160,19 @@ KERI sequence numbers are unbounded integers represented as hex strings. While i
 
 ## HIGH: Security
 
-### H1. The `onlyBacker` modifier is a single point of failure with no recovery path
+### H1. ~~The `onlyBacker` modifier is a single point of failure with no recovery path~~ — RESOLVED
 
 **Spec reference**: Section 3.2
 
-**The problem**: The contract uses `address public immutable backer` set in the constructor. If the backer's Ethereum private key is compromised:
+**Resolution (Feb 2026)**: The modular verifier registry design eliminates this problem entirely.
 
-1. The attacker can anchor arbitrary events, poisoning the first-seen mapping for any controller prefix.
-2. The `immutable` keyword means the backer address cannot be rotated. The contract must be redeployed.
-3. All controllers must be notified to update their configuration to point to the new contract.
-4. All historical anchors on the old contract become unverifiable (or require maintaining the old contract as read-only).
+`KERIBacker` no longer stores a backer pubkey or uses `onlyBacker`. Instead:
+- `KERIBacker.owner` (GLEIF's multisig) governs `approveVerifier`/`revokeVerifier`
+- `Ed25519Verifier.owner` (GLEIF's multisig) governs `approveBacker`/`revokeBacker`
 
-Compare this to KERI's own model: if a witness key is compromised, the controller rotates to a new witness in a `rot` event. The old witness's receipts remain valid because they were signed at a time the key was valid. With the immutable contract, there is no equivalent graceful rotation.
+If a QVI backer's Ed25519 key is compromised, GLEIF calls `Ed25519Verifier.revokeBacker(compromisedPubKey)`. The attacker can no longer anchor events. GLEIF then calls `approveBacker(newPubKey)` for the replacement key. No contract redeployment, no controller migration, no historical anchor disruption — `KERIBacker` and all its anchors remain intact.
 
-**Why it matters**: Key compromise is not hypothetical. If the backer service is hosted and the server is breached, the Ethereum key is exposed. The entire contract (and all controllers relying on it) must be migrated.
-
-**Proposed resolution**: Add a governance mechanism. Options:
-
-- A `rotateBacker(address newBacker)` function callable only by the current backer (allows key rotation but still trusts the current key)
-- A time-locked multi-sig owner that can update the backer address
-- A proxy pattern (UUPS/Transparent) where the proxy admin can update the implementation
-
-The simplest is `rotateBacker` -- it mirrors KERI's own rotation model. If the current key is compromised, the controller rotates the backer in their KEL, which triggers deployment of a new contract with the new backer address.
+**Original problem** (for reference): The old design used `address public immutable backer`. If the backer's Ethereum private key was compromised, the attacker could anchor arbitrary events. The immutable address meant the entire contract had to be redeployed and all controllers notified.
 
 ---
 

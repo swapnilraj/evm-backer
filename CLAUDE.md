@@ -17,8 +17,8 @@ uv run evm-backer start          # run the backer service
 uv run evm-backer query --prefix <AID> --sn <seq> [--said <SAID>]
 
 # Contracts (run from contracts/)
-forge build                      # compile KERIBacker.sol
-forge test                       # run contract tests
+forge build                      # compile all contracts
+forge test                       # run contract tests (30 tests)
 forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --broadcast
 anvil                            # local EVM node for development
 cast call $CONTRACT "isAnchored(bytes32,uint64,bytes32)" <args>
@@ -35,6 +35,9 @@ cast call $CONTRACT "isAnchored(bytes32,uint64,bytes32)" <args>
 - `service.py` — main service loop wiring all modules together
 - `cli.py` — `evm-backer` CLI entry point
 - `contracts/src/KERIBacker.sol` — on-chain anchor; `isAnchored(prefix, sn, said)` is the key function other contracts call
+- `contracts/src/IKERIVerifier.sol` — verifier interface: `verify(bytes32 messageHash, bytes proof)`
+- `contracts/src/Ed25519Verifier.sol` — GLEIF-operated; approves backer pubkeys; proof = `abi.encode(pubKey, r, s)`
+- `contracts/src/SP1KERIVerifier.sol` — GLEIF-operated; delegates to SP1 zkVM verifier; proof = `abi.encode(publicValues, proofBytes)`
 
 ## Critical decisions
 
@@ -42,7 +45,8 @@ cast call $CONTRACT "isAnchored(bytes32,uint64,bytes32)" <args>
 - Events are stored in **contract storage** (not calldata/events only) so other EVM contracts can query them via `staticcall`.
 - The backer exposes the standard KERI witness HTTP interface — controllers configure it exactly like a witness.
 - **Receipt-first model**: the Ed25519 receipt is returned to the controller immediately after keripy validation. On-chain anchoring is asynchronous.
-- **Ed25519 on-chain verification**: the contract verifies Ed25519 signatures directly (via a Solidity verifier) so the backer uses one key for both KERI identity and Ethereum authorization — no separate secp256k1 key.
+- **Modular verifier registry**: `KERIBacker` delegates signature verification to registered `IKERIVerifier` contracts. GLEIF governs which verifiers are approved; `Ed25519Verifier` and `SP1KERIVerifier` are the two implementations. One global `KERIBacker` serves the whole ecosystem — QVIs need no on-chain setup beyond GLEIF adding their pubkey to `Ed25519Verifier`.
+- **Ed25519 on-chain verification**: `Ed25519Verifier` verifies Ed25519 signatures directly (via a Solidity verifier). The backer uses one key for both KERI identity and Ethereum authorization — no separate secp256k1 key.
 - **Prefix/SAID encoding**: `keccak256(qb64_string)` → `bytes32` for both AID prefix and SAID. Collision-resistant, handles arbitrary-length identifiers unambiguously.
 
 ## Open questions (resolve with KERI community before finalising)

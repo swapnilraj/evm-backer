@@ -59,32 +59,58 @@ All configuration is via environment variables:
 | `ETH_CONFIRMATION_DEPTH` | Blocks required for confirmation | `12` |
 | `ETH_TIMEOUT_DEPTH` | Blocks before unconfirmed tx is requeued | `32` |
 
-## Deploying the contract
+## Deploying the contracts
+
+`KERIBacker` is a single global contract shared by all QVIs. `Ed25519Verifier` is GLEIF-operated and holds the approved set of backer pubkeys. Deploy order:
 
 ```bash
 cd contracts
 forge build
+
+# Set env vars
+export OWNER_ADDRESS=<GLEIF multisig or AID-controlled address>
+export BACKER_PUBKEY=<backer Ed25519 pubkey as 0x-prefixed bytes32>
+
 forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --broadcast
 ```
 
-The contract constructor takes the backer's Ed25519 public key. The deployed address goes in `ETH_CONTRACT_ADDRESS`.
+The script deploys `Ed25519Verifier`, approves the first backer pubkey, deploys `KERIBacker`, and wires them together. The deployed `KERIBacker` address goes in `ETH_CONTRACT_ADDRESS`.
+
+To add a new QVI backer after initial deployment:
+
+```bash
+cast send $ED25519_VERIFIER "approveBacker(bytes32)" $NEW_BACKER_PUBKEY \
+    --private-key $OWNER_KEY --rpc-url $ETH_RPC_URL
+```
 
 ## SP1 ZK Proof path
 
-`KERIBacker.sol` supports two anchoring paths:
+`KERIBacker.sol` supports two anchoring paths via the `IKERIVerifier` interface:
 
-- **Standard** (`anchorEvent` / `anchorBatch`): the backer's Ed25519 signature is verified on-chain (~692k gas). This requires no extra tooling.
-- **ZK** (`anchorEventWithZKProof` / `anchorBatchWithZKProof`): Ed25519 verification is done inside the [SP1 zkVM](https://github.com/succinctlabs/sp1); a Groth16 proof is submitted on-chain and verified by `SP1VerifierGroth16` (~275k gas). The backer's key computation moves entirely off-chain.
+- **Standard** (`Ed25519Verifier`): Ed25519 signature verified on-chain (~692k gas). No extra tooling required.
+- **ZK** (`SP1KERIVerifier`): Ed25519 verification runs inside the [SP1 zkVM](https://github.com/succinctlabs/sp1); a Groth16 proof is verified by `SP1VerifierGroth16` (~275k gas). Key computation moves entirely off-chain.
 
-### Configuring the ZK verifier
+Both paths use the same `anchorEvent(prefix, sn, said, verifier, proof)` and `anchorBatch(anchors, verifier, proof)` interface — the verifier address selects the path.
 
-After deploying `KERIBacker.sol`, register the SP1 verifier and program verification key:
+### Deploying SP1KERIVerifier
 
 ```bash
-# The vkey is printed by sp1-prover on first run; save it for this step.
-cast send $CONTRACT "setZKVerifier(address,bytes32,bytes,uint256)" \
-    $SP1_VERIFIER_ADDR $SP1_VKEY $ED25519_SIG $NONCE \
-    --private-key $ETH_PRIVATE_KEY --rpc-url $ETH_RPC_URL
+# Deploy SP1VerifierGroth16 (from sp1-contracts)
+SP1_VERIFIER=$(forge create lib/sp1-contracts/contracts/src/v6.0.0/SP1VerifierGroth16.sol:SP1Verifier \
+    --rpc-url $ETH_RPC_URL --private-key $OWNER_KEY --broadcast | grep "Deployed to:" | awk '{print $3}')
+
+# Deploy SP1KERIVerifier with the real program vkey (printed by sp1-prover on first run)
+SP1_KERI=$(forge create src/SP1KERIVerifier.sol:SP1KERIVerifier \
+    --constructor-args $SP1_VERIFIER $SP1_VKEY $OWNER_ADDRESS \
+    --rpc-url $ETH_RPC_URL --private-key $OWNER_KEY --broadcast | grep "Deployed to:" | awk '{print $3}')
+
+# Approve the backer pubkey on SP1KERIVerifier
+cast send $SP1_KERI "approveBacker(bytes32)" $BACKER_PUBKEY \
+    --private-key $OWNER_KEY --rpc-url $ETH_RPC_URL
+
+# Register SP1KERIVerifier with KERIBacker
+cast send $KERI_BACKER "approveVerifier(address)" $SP1_KERI \
+    --private-key $OWNER_KEY --rpc-url $ETH_RPC_URL
 ```
 
 For local development with Anvil, `SP1MockVerifier` (from sp1-contracts) accepts empty proof bytes and can be used without any SP1 toolchain.
@@ -138,10 +164,11 @@ backer.py  (keripy Kevery + Tevery + Parser)
         │  batches events for 10s or until 20 events accumulate
         ▼
       transactions.py  (EIP-1559 tx construction + Ed25519 signing)
-        │
+        │  builds proof = abi.encode(pubKey, r, s)
         ▼
-      KERIBacker.sol  (anchorBatch / anchorBatchWithZKProof)
-        │  stores (keccak256(prefix), sn) → (keccak256(said), blockNumber)
+      KERIBacker.sol  anchorBatch(anchors, verifier, proof)
+        │  calls IKERIVerifier(verifier).verify(messageHash, proof)
+        │  stores (keccak256(prefix), sn) → (keccak256(said), blockNumber, verifier)
         ▼
       crawler.py  (Crawler)
         │  waits 12 confirmations, detects reorgs, requeues on revert/timeout
@@ -164,12 +191,15 @@ src/evm_backer/
   proofs.py        — SP1 ZK proof generation (generate_sp1_proof / make_mock_sp1_proof)
 
 contracts/
-  src/KERIBacker.sol       — on-chain anchor contract (standard + ZK paths)
-  src/Ed25519.sol          — Solidity Ed25519 signature verifier
-  lib/sp1-contracts/       — Succinct SP1 verifier contracts
-  lib/forge-std/           — Foundry test helpers
-  script/Deploy.s.sol      — forge deployment script
-  test/KERIBacker.t.sol    — Foundry tests (33 tests)
+  src/KERIBacker.sol         — on-chain anchor contract; owner governs verifier registry
+  src/IKERIVerifier.sol      — verifier interface: verify(bytes32, bytes)
+  src/Ed25519Verifier.sol    — GLEIF-operated Ed25519 verifier with approvedBackers set
+  src/SP1KERIVerifier.sol    — GLEIF-operated SP1 ZK verifier with approvedBackers set
+  src/Ed25519.sol            — Solidity Ed25519 signature verifier (primitive)
+  lib/sp1-contracts/         — Succinct SP1 verifier contracts
+  lib/forge-std/             — Foundry test helpers
+  script/Deploy.s.sol        — forge deployment script (Ed25519Verifier + KERIBacker)
+  test/KERIBacker.t.sol      — Foundry tests (30 tests)
 
 sp1-guest/               — SP1 guest program (Ed25519 verify inside zkVM)
 sp1-prover/              — SP1 host prover CLI
@@ -182,7 +212,7 @@ sp1-prover/              — SP1 host prover CLI
 uv run pytest tests/ -q
 
 # Contract tests
-cd contracts && forge test -v
+forge test --root contracts -v
 
 # Real Groth16 end-to-end (slow — ~7 min, requires SP1 toolchain)
 REAL_SP1_PROOF=1 uv run pytest tests/test_zk_real.py -v -s
@@ -190,7 +220,9 @@ REAL_SP1_PROOF=1 uv run pytest tests/test_zk_real.py -v -s
 
 ## Key design decisions
 
-**Ed25519 on-chain verification** — The contract verifies Ed25519 signatures directly via a Solidity verifier. The backer uses one key for both KERI identity and Ethereum authorization, giving tight cryptographic binding per the KERI spec.
+**Modular verifier registry** — `KERIBacker` delegates all signature verification to registered `IKERIVerifier` contracts. GLEIF governs which verifiers are approved via `approveVerifier`/`revokeVerifier`. This means one global `KERIBacker` serves the whole ecosystem; QVIs need no on-chain setup beyond GLEIF adding their pubkey to `Ed25519Verifier` as part of accreditation.
+
+**Ed25519 on-chain verification** — `Ed25519Verifier` verifies Ed25519 signatures directly via a Solidity verifier. The backer uses one key for both KERI identity and Ethereum authorization, giving tight cryptographic binding per the KERI spec.
 
 **Receipt-first** — Receipts are returned immediately after keripy validation, before on-chain confirmation. This matches standard KERI witness behaviour. On-chain anchoring is asynchronous.
 
