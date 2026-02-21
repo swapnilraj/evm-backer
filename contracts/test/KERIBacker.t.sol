@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {VmSafe} from "forge-std/Vm.sol";
 import {KERIBacker} from "../src/KERIBacker.sol";
+import {Ed25519Verifier} from "../src/Ed25519Verifier.sol";
+import {SP1KERIVerifier} from "../src/SP1KERIVerifier.sol";
 import {Ed25519} from "../src/Ed25519.sol";
 import {SP1MockVerifier} from "@sp1-contracts/SP1MockVerifier.sol";
 
@@ -18,15 +20,21 @@ abstract contract KERIBackerTestBase is Test {
     bytes32 public constant BACKER_PUBKEY =
         0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025;
 
-    /// @dev Sign a message with the test Ed25519 key via Python FFI.
-    ///      The Python script outputs "0x" + hex(signature), which forge
-    ///      decodes into raw bytes automatically.
+    /// @dev Sign a message with the test Ed25519 key via Python FFI and return
+    ///      the encoded Ed25519Verifier proof: abi.encode(backerPubKey, r, s).
     function _sign(bytes memory message) internal returns (bytes memory) {
         string[] memory cmd = new string[](3);
         cmd[0] = "python3";
         cmd[1] = "test/sign_ed25519.py";
         cmd[2] = _toHex(message);
-        return vm.ffi(cmd);
+        bytes memory sig = vm.ffi(cmd);  // 64 bytes: r (32) + s (32)
+        bytes32 r;
+        bytes32 s;
+        assembly {
+            r := mload(add(sig, 32))
+            s := mload(add(sig, 64))
+        }
+        return abi.encode(BACKER_PUBKEY, r, s);
     }
 
     function _toHex(bytes memory data) internal pure returns (string memory) {
@@ -41,51 +49,57 @@ abstract contract KERIBackerTestBase is Test {
 }
 
 // =============================================================================
-// Standard path tests (Ed25519 on-chain verification)
+// Standard path tests (Ed25519 on-chain verification via Ed25519Verifier)
 // =============================================================================
 
 contract KERIBackerTest is KERIBackerTestBase {
-    KERIBacker public kb;
+    KERIBacker      public kb;
+    Ed25519Verifier public ed25519Verifier;
 
     bytes32 public prefix1 = keccak256("AID_prefix_1");
     bytes32 public prefix2 = keccak256("AID_prefix_2");
-    bytes32 public said1 = keccak256("event_said_1");
-    bytes32 public said2 = keccak256("event_said_2");
-    bytes32 public said3 = keccak256("event_said_3");
+    bytes32 public said1   = keccak256("event_said_1");
+    bytes32 public said2   = keccak256("event_said_2");
+    bytes32 public said3   = keccak256("event_said_3");
 
     event KERIEventAnchored(
         bytes32 indexed prefix,
-        uint64 indexed sn,
-        bytes32 indexed eventSAID
+        uint64  indexed sn,
+        bytes32 indexed eventSAID,
+        address         verifier
     );
 
     event DuplicityDetected(
         bytes32 indexed prefix,
-        uint64 indexed sn,
-        bytes32 firstSeenSAID,
-        bytes32 conflictingSAID
+        uint64  indexed sn,
+        bytes32         firstSeenSAID,
+        bytes32         conflictingSAID
     );
 
-    event BackerRotated(
-        bytes32 indexed oldPubKey,
-        bytes32 indexed newPubKey
-    );
+    event VerifierApproved(address indexed verifier);
+    event VerifierRevoked(address indexed verifier);
 
     function setUp() public {
-        kb = new KERIBacker(BACKER_PUBKEY);
+        // Deploy Ed25519Verifier with this test contract as owner, pre-approve test key
+        ed25519Verifier = new Ed25519Verifier(address(this));
+        ed25519Verifier.approveBacker(BACKER_PUBKEY);
+
+        // Deploy KERIBacker with this test contract as owner, approve the verifier
+        kb = new KERIBacker(address(this));
+        kb.approveVerifier(address(ed25519Verifier));
     }
 
     // =========================================================================
     // Constructor
     // =========================================================================
 
-    function test_constructor_setsBacker() public view {
-        assertEq(kb.backerPubKey(), BACKER_PUBKEY);
+    function test_constructor_setsOwner() public view {
+        assertEq(kb.owner(), address(this));
     }
 
-    function test_constructor_rejectsZeroPubkey() public {
-        vm.expectRevert("KERIBacker: zero pubkey");
-        new KERIBacker(bytes32(0));
+    function test_constructor_rejectsZeroOwner() public {
+        vm.expectRevert("KERIBacker: zero owner");
+        new KERIBacker(address(0));
     }
 
     // =========================================================================
@@ -109,19 +123,63 @@ contract KERIBackerTest is KERIBackerTestBase {
     }
 
     // =========================================================================
+    // Governance
+    // =========================================================================
+
+    function test_approveVerifier_setsMapping() public {
+        address newVerifier = address(0xBEEF);
+        assertFalse(kb.approvedVerifiers(newVerifier));
+        kb.approveVerifier(newVerifier);
+        assertTrue(kb.approvedVerifiers(newVerifier));
+    }
+
+    function test_approveVerifier_emitsEvent() public {
+        address newVerifier = address(0xCAFE);
+        vm.expectEmit(true, false, false, false);
+        emit VerifierApproved(newVerifier);
+        kb.approveVerifier(newVerifier);
+    }
+
+    function test_approveVerifier_onlyOwner() public {
+        vm.prank(address(0xDEAD));
+        vm.expectRevert("KERIBacker: not owner");
+        kb.approveVerifier(address(0x1234));
+    }
+
+    function test_revokeVerifier_preventsAnchoring() public {
+        // Revoke the verifier
+        kb.revokeVerifier(address(ed25519Verifier));
+        assertFalse(kb.approvedVerifiers(address(ed25519Verifier)));
+
+        bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        vm.expectRevert("KERIBacker: verifier not approved");
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
+    }
+
+    function test_revokeVerifier_emitsEvent() public {
+        vm.expectEmit(true, false, false, false);
+        emit VerifierRevoked(address(ed25519Verifier));
+        kb.revokeVerifier(address(ed25519Verifier));
+    }
+
+    // =========================================================================
     // Access control
     // =========================================================================
 
-    function test_anchorEvent_revertsWithInvalidSig() public {
-        bytes memory badSig = new bytes(64);
-        vm.expectRevert("KERIBacker: invalid signature");
-        kb.anchorEvent(prefix1, 0, said1, badSig);
+    function test_anchorEvent_rejectsUnregisteredVerifier() public {
+        address fakeVerifier = address(0x1234);
+        bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        vm.expectRevert("KERIBacker: verifier not approved");
+        kb.anchorEvent(prefix1, 0, said1, fakeVerifier, proof);
     }
 
-    function test_anchorEvent_revertsWithWrongSigLength() public {
-        bytes memory shortSig = new bytes(32);
-        vm.expectRevert("KERIBacker: invalid sig length");
-        kb.anchorEvent(prefix1, 0, said1, shortSig);
+    function test_anchorEvent_revertsWithInvalidSig() public {
+        // Proof has correct structure but invalid r,s (all zeros)
+        bytes memory badProof = abi.encode(BACKER_PUBKEY, bytes32(0), bytes32(0));
+        vm.expectRevert("KERIBacker: verification failed");
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), badProof);
     }
 
     // =========================================================================
@@ -130,30 +188,31 @@ contract KERIBackerTest is KERIBackerTestBase {
 
     function test_anchorEvent_storesRecord() public {
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.anchorEvent(prefix1, 0, said1, sig);
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
 
         KERIBacker.AnchorRecord memory rec = kb.getAnchor(prefix1, 0);
         assertTrue(rec.exists);
         assertEq(rec.eventSAID, said1);
         assertEq(rec.blockNumber, uint64(block.number));
+        assertEq(rec.verifier, address(ed25519Verifier));
     }
 
     function test_anchorEvent_emitsKERIEventAnchored() public {
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
 
         vm.expectEmit(true, true, true, true);
-        emit KERIEventAnchored(prefix1, 0, said1);
-        kb.anchorEvent(prefix1, 0, said1, sig);
+        emit KERIEventAnchored(prefix1, 0, said1, address(ed25519Verifier));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
     }
 
     function test_anchorEvent_multipleSequenceNumbers() public {
         for (uint64 sn = 0; sn < 3; sn++) {
             bytes32 said = sn == 0 ? said1 : (sn == 1 ? said2 : said3);
             bytes32 msgHash = keccak256(abi.encode(prefix1, sn, said));
-            bytes memory sig = _sign(abi.encodePacked(msgHash));
-            kb.anchorEvent(prefix1, sn, said, sig);
+            bytes memory proof = _sign(abi.encodePacked(msgHash));
+            kb.anchorEvent(prefix1, sn, said, address(ed25519Verifier), proof);
         }
         assertTrue(kb.isAnchored(prefix1, 0, said1));
         assertTrue(kb.isAnchored(prefix1, 1, said2));
@@ -162,12 +221,12 @@ contract KERIBackerTest is KERIBackerTestBase {
 
     function test_anchorEvent_multiplePrefixes() public {
         bytes32 msg1 = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig1 = _sign(abi.encodePacked(msg1));
-        kb.anchorEvent(prefix1, 0, said1, sig1);
+        bytes memory proof1 = _sign(abi.encodePacked(msg1));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof1);
 
         bytes32 msg2 = keccak256(abi.encode(prefix2, uint64(0), said2));
-        bytes memory sig2 = _sign(abi.encodePacked(msg2));
-        kb.anchorEvent(prefix2, 0, said2, sig2);
+        bytes memory proof2 = _sign(abi.encodePacked(msg2));
+        kb.anchorEvent(prefix2, 0, said2, address(ed25519Verifier), proof2);
 
         assertTrue(kb.isAnchored(prefix1, 0, said1));
         assertTrue(kb.isAnchored(prefix2, 0, said2));
@@ -180,11 +239,11 @@ contract KERIBackerTest is KERIBackerTestBase {
 
     function test_firstSeen_idempotentResubmission() public {
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.anchorEvent(prefix1, 0, said1, sig);
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
 
         vm.recordLogs();
-        kb.anchorEvent(prefix1, 0, said1, sig);
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
 
         VmSafe.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i = 0; i < logs.length; i++) {
@@ -198,12 +257,12 @@ contract KERIBackerTest is KERIBackerTestBase {
 
     function test_firstSeen_conflictingSAIDDoesNotOverwrite() public {
         bytes32 msg1 = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig1 = _sign(abi.encodePacked(msg1));
-        kb.anchorEvent(prefix1, 0, said1, sig1);
+        bytes memory proof1 = _sign(abi.encodePacked(msg1));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof1);
 
         bytes32 msg2 = keccak256(abi.encode(prefix1, uint64(0), said2));
-        bytes memory sig2 = _sign(abi.encodePacked(msg2));
-        kb.anchorEvent(prefix1, 0, said2, sig2);
+        bytes memory proof2 = _sign(abi.encodePacked(msg2));
+        kb.anchorEvent(prefix1, 0, said2, address(ed25519Verifier), proof2);
 
         assertTrue(kb.isAnchored(prefix1, 0, said1));
         assertFalse(kb.isAnchored(prefix1, 0, said2));
@@ -211,15 +270,15 @@ contract KERIBackerTest is KERIBackerTestBase {
 
     function test_firstSeen_emitsDuplicityDetected() public {
         bytes32 msg1 = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig1 = _sign(abi.encodePacked(msg1));
-        kb.anchorEvent(prefix1, 0, said1, sig1);
+        bytes memory proof1 = _sign(abi.encodePacked(msg1));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof1);
 
         vm.expectEmit(true, true, false, true);
         emit DuplicityDetected(prefix1, 0, said1, said2);
 
         bytes32 msg2 = keccak256(abi.encode(prefix1, uint64(0), said2));
-        bytes memory sig2 = _sign(abi.encodePacked(msg2));
-        kb.anchorEvent(prefix1, 0, said2, sig2);
+        bytes memory proof2 = _sign(abi.encodePacked(msg2));
+        kb.anchorEvent(prefix1, 0, said2, address(ed25519Verifier), proof2);
     }
 
     // =========================================================================
@@ -233,8 +292,8 @@ contract KERIBackerTest is KERIBackerTestBase {
         anchors[2] = KERIBacker.Anchor(prefix2, 0, said3);
 
         bytes32 msgHash = keccak256(abi.encode(anchors));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.anchorBatch(anchors, sig);
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        kb.anchorBatch(anchors, address(ed25519Verifier), proof);
 
         assertTrue(kb.isAnchored(prefix1, 0, said1));
         assertTrue(kb.isAnchored(prefix1, 1, said2));
@@ -244,16 +303,16 @@ contract KERIBackerTest is KERIBackerTestBase {
     function test_anchorBatch_emptyArray() public {
         KERIBacker.Anchor[] memory anchors = new KERIBacker.Anchor[](0);
         bytes32 msgHash = keccak256(abi.encode(anchors));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.anchorBatch(anchors, sig);
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        kb.anchorBatch(anchors, address(ed25519Verifier), proof);
         // Empty batch with valid signature should succeed without anchoring anything
         assertFalse(kb.isAnchored(prefix1, 0, said1));
     }
 
     function test_anchorBatch_handlesDuplicityInBatch() public {
         bytes32 anchorMsg = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory anchorSig = _sign(abi.encodePacked(anchorMsg));
-        kb.anchorEvent(prefix1, 0, said1, anchorSig);
+        bytes memory anchorProof = _sign(abi.encodePacked(anchorMsg));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), anchorProof);
 
         KERIBacker.Anchor[] memory anchors = new KERIBacker.Anchor[](2);
         anchors[0] = KERIBacker.Anchor(prefix1, 0, said2);
@@ -263,85 +322,12 @@ contract KERIBackerTest is KERIBackerTestBase {
         emit DuplicityDetected(prefix1, 0, said1, said2);
 
         bytes32 batchMsg = keccak256(abi.encode(anchors));
-        bytes memory batchSig = _sign(abi.encodePacked(batchMsg));
-        kb.anchorBatch(anchors, batchSig);
+        bytes memory batchProof = _sign(abi.encodePacked(batchMsg));
+        kb.anchorBatch(anchors, address(ed25519Verifier), batchProof);
 
         assertTrue(kb.isAnchored(prefix1, 0, said1));
         assertFalse(kb.isAnchored(prefix1, 0, said2));
         assertTrue(kb.isAnchored(prefix1, 1, said3));
-    }
-
-    // =========================================================================
-    // rotateBacker
-    // =========================================================================
-
-    function test_rotateBacker_updatesBackerPubKey() public {
-        bytes32 newPubKey = keccak256("newPubKey");
-        uint256 nonce = 1;
-        bytes32 msgHash = keccak256(abi.encodePacked(newPubKey, nonce));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.rotateBacker(newPubKey, sig, nonce);
-        assertEq(kb.backerPubKey(), newPubKey);
-    }
-
-    function test_rotateBacker_rejectsZeroPubkey() public {
-        uint256 nonce = 2;
-        bytes32 msgHash = keccak256(abi.encodePacked(bytes32(0), nonce));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        vm.expectRevert("KERIBacker: zero pubkey");
-        kb.rotateBacker(bytes32(0), sig, nonce);
-    }
-
-    function test_rotateBacker_rejectsReusedNonce() public {
-        bytes32 newPubKey1 = keccak256("newPubKey1");
-        uint256 nonce = 3;
-        bytes32 msgHash1 = keccak256(abi.encodePacked(newPubKey1, nonce));
-        bytes memory sig1 = _sign(abi.encodePacked(msgHash1));
-        kb.rotateBacker(newPubKey1, sig1, nonce);
-
-        bytes32 newPubKey2 = keccak256("newPubKey2");
-        bytes32 msgHash2 = keccak256(abi.encodePacked(newPubKey2, nonce));
-        bytes memory sig2 = _sign(abi.encodePacked(msgHash2));
-        vm.expectRevert("KERIBacker: nonce reused");
-        kb.rotateBacker(newPubKey2, sig2, nonce);
-    }
-
-    function test_rotateBacker_emitsBackerRotatedEvent() public {
-        bytes32 newPubKey = keccak256("newPubKeyForEvent");
-        uint256 nonce = 4;
-        bytes32 msgHash = keccak256(abi.encodePacked(newPubKey, nonce));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-
-        vm.expectEmit(true, true, false, false);
-        emit BackerRotated(BACKER_PUBKEY, newPubKey);
-        kb.rotateBacker(newPubKey, sig, nonce);
-    }
-
-    function test_rotateBacker_oldKeyCannotAnchorAfterRotation() public {
-        bytes32 newPubKey = keccak256("newPubKeyOldKeyTest");
-        uint256 nonce = 5;
-        bytes32 rotMsg = keccak256(abi.encodePacked(newPubKey, nonce));
-        bytes memory rotSig = _sign(abi.encodePacked(rotMsg));
-        kb.rotateBacker(newPubKey, rotSig, nonce);
-
-        bytes32 anchorMsg = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory anchorSig = _sign(abi.encodePacked(anchorMsg));
-        vm.expectRevert("KERIBacker: invalid signature");
-        kb.anchorEvent(prefix1, 0, said1, anchorSig);
-    }
-
-    function test_rotateBacker_preservesHistoricalAnchors() public {
-        bytes32 anchorMsg = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory anchorSig = _sign(abi.encodePacked(anchorMsg));
-        kb.anchorEvent(prefix1, 0, said1, anchorSig);
-
-        bytes32 newPubKey = keccak256("newPubKeyHistory");
-        uint256 nonce = 6;
-        bytes32 rotMsg = keccak256(abi.encodePacked(newPubKey, nonce));
-        bytes memory rotSig = _sign(abi.encodePacked(rotMsg));
-        kb.rotateBacker(newPubKey, rotSig, nonce);
-
-        assertTrue(kb.isAnchored(prefix1, 0, said1));
     }
 
     // =========================================================================
@@ -354,15 +340,15 @@ contract KERIBackerTest is KERIBackerTestBase {
 
     function test_isAnchored_returnsFalseForWrongSAID() public {
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.anchorEvent(prefix1, 0, said1, sig);
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
         assertFalse(kb.isAnchored(prefix1, 0, said2));
     }
 
     function test_isAnchored_returnsFalseForWrongSn() public {
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.anchorEvent(prefix1, 0, said1, sig);
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
         assertFalse(kb.isAnchored(prefix1, 1, said1));
     }
 
@@ -375,13 +361,14 @@ contract KERIBackerTest is KERIBackerTestBase {
         assertFalse(rec.exists);
         assertEq(rec.eventSAID, bytes32(0));
         assertEq(rec.blockNumber, 0);
+        assertEq(rec.verifier, address(0));
     }
 
     function test_getAnchor_recordsBlockNumber() public {
         vm.roll(12345);
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.anchorEvent(prefix1, 0, said1, sig);
+        bytes memory proof = _sign(abi.encodePacked(msgHash));
+        kb.anchorEvent(prefix1, 0, said1, address(ed25519Verifier), proof);
 
         KERIBacker.AnchorRecord memory rec = kb.getAnchor(prefix1, 0);
         assertEq(rec.blockNumber, 12345);
@@ -389,12 +376,13 @@ contract KERIBackerTest is KERIBackerTestBase {
 }
 
 // =============================================================================
-// SP1 ZK Proof tests
+// SP1 ZK Proof tests (via SP1KERIVerifier + SP1MockVerifier)
 // =============================================================================
 
 contract KERIBackerZKTest is KERIBackerTestBase {
-    KERIBacker public kb;
-    SP1MockVerifier public mockSP1;
+    KERIBacker       public kb;
+    SP1KERIVerifier  public sp1KeriVerifier;
+    SP1MockVerifier  public mockSP1;
 
     bytes32 public prefix1 = keccak256("AID_prefix_1");
     bytes32 public said1   = keccak256("event_said_1");
@@ -402,50 +390,43 @@ contract KERIBackerZKTest is KERIBackerTestBase {
     bytes32 public said3   = keccak256("event_said_3");
 
     function setUp() public {
-        kb = new KERIBacker(BACKER_PUBKEY);
+        // Deploy SP1MockVerifier and SP1KERIVerifier with test pubkey pre-approved
         mockSP1 = new SP1MockVerifier();
+        sp1KeriVerifier = new SP1KERIVerifier(address(mockSP1), bytes32(0), address(this));
+        sp1KeriVerifier.approveBacker(BACKER_PUBKEY);
 
-        // Configure ZK verifier: sign keccak256(abi.encodePacked(address, vkey, nonce))
-        uint256 nonce = 99;
-        bytes32 msgHash = keccak256(abi.encodePacked(address(mockSP1), bytes32(0), nonce));
-        bytes memory sig = _sign(abi.encodePacked(msgHash));
-        kb.setZKVerifier(address(mockSP1), bytes32(0), sig, nonce);
+        // Deploy KERIBacker and approve the SP1 verifier
+        kb = new KERIBacker(address(this));
+        kb.approveVerifier(address(sp1KeriVerifier));
+    }
+
+    /// @dev Build a mock SP1 proof for testing:
+    ///      publicValues = abi.encode(backerPubKey, msgHash)
+    ///      proof        = abi.encode(publicValues, "")  [empty proofBytes for MockVerifier]
+    function _makeZKProof(bytes32 msgHash) internal pure returns (bytes memory proof) {
+        bytes memory publicValues = abi.encode(BACKER_PUBKEY, msgHash);
+        proof = abi.encode(publicValues, bytes(""));
     }
 
     // =========================================================================
-    // setZKVerifier
-    // =========================================================================
-
-    function test_setZKVerifier_updatesState() public view {
-        assertEq(address(kb.sp1Verifier()), address(mockSP1));
-        assertEq(kb.sp1VKey(), bytes32(0));
-    }
-
-    function test_setZKVerifier_rejectsReusedNonce() public {
-        // nonce 99 was consumed in setUp(); any sig will do since nonce check runs first
-        bytes memory anySig = new bytes(64);
-        vm.expectRevert("KERIBacker: nonce reused");
-        kb.setZKVerifier(address(mockSP1), bytes32(0), anySig, 99);
-    }
-
-    // =========================================================================
-    // anchorEventWithZKProof
+    // anchorEvent with SP1 ZK proof
     // =========================================================================
 
     function test_anchorEventWithZKProof_storesRecord() public {
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory publicValues = abi.encode(BACKER_PUBKEY, msgHash);
+        bytes memory proof = _makeZKProof(msgHash);
 
-        kb.anchorEventWithZKProof(prefix1, 0, said1, publicValues, "");
+        kb.anchorEvent(prefix1, 0, said1, address(sp1KeriVerifier), proof);
 
         assertTrue(kb.isAnchored(prefix1, 0, said1));
         KERIBacker.AnchorRecord memory rec = kb.getAnchor(prefix1, 0);
         assertTrue(rec.exists);
         assertEq(rec.eventSAID, said1);
+        assertEq(rec.verifier, address(sp1KeriVerifier));
     }
 
     // =========================================================================
-    // anchorBatchWithZKProof
+    // anchorBatch with SP1 ZK proof
     // =========================================================================
 
     function test_anchorBatchWithZKProof_anchorsMultipleEvents() public {
@@ -455,9 +436,9 @@ contract KERIBackerZKTest is KERIBackerTestBase {
         anchors[2] = KERIBacker.Anchor(prefix1, 2, said3);
 
         bytes32 msgHash = keccak256(abi.encode(anchors));
-        bytes memory publicValues = abi.encode(BACKER_PUBKEY, msgHash);
+        bytes memory proof = _makeZKProof(msgHash);
 
-        kb.anchorBatchWithZKProof(anchors, publicValues, "");
+        kb.anchorBatch(anchors, address(sp1KeriVerifier), proof);
 
         assertTrue(kb.isAnchored(prefix1, 0, said1));
         assertTrue(kb.isAnchored(prefix1, 1, said2));
@@ -472,16 +453,18 @@ contract KERIBackerZKTest is KERIBackerTestBase {
         bytes32 wrongPubkey = keccak256("wrong_pubkey");
         bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
         bytes memory publicValues = abi.encode(wrongPubkey, msgHash);
+        bytes memory proof = abi.encode(publicValues, bytes(""));
 
-        vm.expectRevert("KERIBacker: ZK proof wrong pubkey");
-        kb.anchorEventWithZKProof(prefix1, 0, said1, publicValues, "");
+        vm.expectRevert("SP1KERIVerifier: backer not approved");
+        kb.anchorEvent(prefix1, 0, said1, address(sp1KeriVerifier), proof);
     }
 
     function test_anchorWithZKProof_rejectsWrongMessage() public {
         bytes32 wrongMsgHash = keccak256("wrong_message");
         bytes memory publicValues = abi.encode(BACKER_PUBKEY, wrongMsgHash);
+        bytes memory proof = abi.encode(publicValues, bytes(""));
 
-        vm.expectRevert("KERIBacker: ZK proof wrong message");
-        kb.anchorEventWithZKProof(prefix1, 0, said1, publicValues, "");
+        vm.expectRevert("SP1KERIVerifier: wrong message");
+        kb.anchorEvent(prefix1, 0, said1, address(sp1KeriVerifier), proof);
     }
 }

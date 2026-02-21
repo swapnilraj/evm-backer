@@ -32,6 +32,7 @@ from web3 import Web3
 
 from tests.conftest import (
     ANVIL_BACKER_KEY,
+    ANVIL_DEPLOYER_ADDRESS,
     ANVIL_DEPLOYER_KEY,
     ANVIL_RPC_URL,
     CONTRACTS_DIR,
@@ -104,25 +105,6 @@ def _load_abi(contracts_dir, contract_name):
         return json.load(f)["abi"]
 
 
-def _configure_zk_verifier(w3, contract, verifier_address, sp1_vkey_bytes, nonce, account):
-    """Call setZKVerifier on contract, signed with the test Ed25519 key."""
-    verifier_addr_bytes = bytes.fromhex(verifier_address.lstrip("0x").zfill(40))
-    # abi.encodePacked(address, bytes32, uint256) = 20 + 32 + 32 bytes
-    packed = verifier_addr_bytes + sp1_vkey_bytes + nonce.to_bytes(32, "big")
-    msg_hash = Web3.keccak(packed)
-    sig = ED25519_SIGNING_KEY.sign(msg_hash).signature
-
-    receipt = _build_and_send(
-        w3, account,
-        contract.functions.setZKVerifier(verifier_address, sp1_vkey_bytes, sig, nonce),
-        gas=1_500_000,  # Ed25519.verify costs ~692k gas
-    )
-    assert receipt.status == 1, (
-        f"setZKVerifier reverted. Gas used: {receipt.gasUsed}. "
-        f"verifier={verifier_address}, vkey={sp1_vkey_bytes.hex()}, nonce={nonce}"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Fast path: real binary, mock proving, SP1MockVerifier
 # ---------------------------------------------------------------------------
@@ -149,7 +131,7 @@ class TestRealProverBinaryFast:
         old_val = os.environ.get("SP1_PROVER")
         os.environ["SP1_PROVER"] = "mock"
         try:
-            proof_bytes, public_values, vkey = generate_sp1_proof(
+            contract_proof, public_values, vkey = generate_sp1_proof(
                 backer_signing_key, msg_hash, pubkey_bytes
             )
         finally:
@@ -157,9 +139,6 @@ class TestRealProverBinaryFast:
                 os.environ.pop("SP1_PROVER", None)
             else:
                 os.environ["SP1_PROVER"] = old_val
-
-        # Mock mode: proof is empty (SP1MockVerifier accepts this)
-        assert proof_bytes == b"", f"mock proof should be empty, got {len(proof_bytes)} bytes"
 
         # Public values: raw 64 bytes = pubkey || msg_hash
         # (same as abi.encode(bytes32, bytes32) since both are already 32 bytes)
@@ -173,13 +152,23 @@ class TestRealProverBinaryFast:
         assert vkey.startswith("0x"), f"vkey must start with 0x, got: {vkey!r}"
         assert len(bytes.fromhex(vkey[2:])) == 32, f"vkey must be 32 bytes: {vkey}"
 
+        # contract_proof = abi.encode(publicValues, proofBytes) for SP1KERIVerifier.
+        # In mock mode the inner proof bytes are empty (SP1MockVerifier accepts this).
+        from eth_abi import decode as abi_decode
+        inner_pv, inner_pb = abi_decode(["bytes", "bytes"], contract_proof)
+        assert inner_pv == public_values, "contract_proof must embed the correct public values"
+        assert inner_pb == b"", (
+            f"mock mode must produce empty inner proof bytes, got {len(inner_pb)} bytes"
+        )
+
     def test_anchor_event_full_pipeline(self, w3, contract_with_zk, backer_account, backer_signing_key):
-        """Full end-to-end: sp1-prover binary → anchorEventWithZKProof → isAnchored.
+        """Full end-to-end: sp1-prover binary → anchorEvent (SP1 path) → isAnchored.
 
         Uses SP1_PROVER=mock so the guest runs but proof bytes are empty.
         SP1MockVerifier (already configured in contract_with_zk) accepts empty proofs.
         """
         contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
         prefix_b32 = Web3.keccak(text="real_prover_single_prefix")
         sn = 0
         said_b32 = Web3.keccak(text="real_prover_single_said")
@@ -196,7 +185,7 @@ class TestRealProverBinaryFast:
         old_val = os.environ.get("SP1_PROVER")
         os.environ["SP1_PROVER"] = "mock"
         try:
-            proof_bytes, public_values, vkey = generate_sp1_proof(
+            contract_proof, public_values, vkey = generate_sp1_proof(
                 backer_signing_key, msg_hash, pubkey_bytes
             )
         finally:
@@ -207,21 +196,22 @@ class TestRealProverBinaryFast:
 
         receipt = _build_and_send(
             w3, backer_account,
-            contract.functions.anchorEventWithZKProof(
-                prefix_b32, sn, said_b32, public_values, proof_bytes
+            contract.functions.anchorEvent(
+                prefix_b32, sn, said_b32, sp1_verifier, contract_proof
             ),
             gas=500_000,
         )
         assert receipt.status == 1, (
-            f"anchorEventWithZKProof reverted. Gas used: {receipt.gasUsed}"
+            f"anchorEvent (SP1 path) reverted. Gas used: {receipt.gasUsed}"
         )
         assert contract.functions.isAnchored(prefix_b32, sn, said_b32).call(), (
             "isAnchored() should return True after anchoring with sp1-prover binary"
         )
 
     def test_anchor_batch_full_pipeline(self, w3, contract_with_zk, backer_account, backer_signing_key):
-        """Full end-to-end: sp1-prover binary → anchorBatchWithZKProof → isAnchored."""
+        """Full end-to-end: sp1-prover binary → anchorBatch (SP1 path) → isAnchored."""
         contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
         pubkey_bytes = backer_signing_key.verify_key.encode()
 
         anchors = [
@@ -236,7 +226,7 @@ class TestRealProverBinaryFast:
         old_val = os.environ.get("SP1_PROVER")
         os.environ["SP1_PROVER"] = "mock"
         try:
-            proof_bytes, public_values, vkey = generate_sp1_proof(
+            contract_proof, public_values, vkey = generate_sp1_proof(
                 backer_signing_key, msg_hash, pubkey_bytes
             )
         finally:
@@ -247,11 +237,11 @@ class TestRealProverBinaryFast:
 
         receipt = _build_and_send(
             w3, backer_account,
-            contract.functions.anchorBatchWithZKProof(anchors, public_values, proof_bytes),
+            contract.functions.anchorBatch(anchors, sp1_verifier, contract_proof),
             gas=500_000,
         )
         assert receipt.status == 1, (
-            f"anchorBatchWithZKProof reverted. Gas used: {receipt.gasUsed}"
+            f"anchorBatch (SP1 path) reverted. Gas used: {receipt.gasUsed}"
         )
         for prefix, sn, said in anchors:
             assert contract.functions.isAnchored(prefix, sn, said).call(), (
@@ -259,14 +249,15 @@ class TestRealProverBinaryFast:
             )
 
     def test_wrong_pubkey_in_public_values_reverts(self, w3, contract_with_zk, backer_account, backer_signing_key):
-        """If public values carry wrong pubkey, anchorEventWithZKProof must revert.
+        """If public values carry an unapproved pubkey, anchorEvent (SP1 path) must revert.
 
-        The prover binary signs with the wrong key; the contract checks
-        pvPubKey == backerPubKey and reverts on mismatch.
+        The prover binary signs with a key that's not in SP1KERIVerifier.approvedBackers;
+        the verifier checks approvedBackers[pvPubKey] and reverts on mismatch.
         """
         import nacl.signing
 
         contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
         prefix_b32 = Web3.keccak(text="rb_wrong_pk_prefix")
         sn = 0
         said_b32 = Web3.keccak(text="rb_wrong_pk_said")
@@ -277,14 +268,14 @@ class TestRealProverBinaryFast:
         )
         msg_hash = Web3.keccak(encoded)
 
-        # Use a different key — the binary will produce publicValues with wrong pubkey
+        # Use a different key — not approved in SP1KERIVerifier.approvedBackers
         other_key = nacl.signing.SigningKey.generate()
         other_pubkey = other_key.verify_key.encode()
 
         old_val = os.environ.get("SP1_PROVER")
         os.environ["SP1_PROVER"] = "mock"
         try:
-            proof_bytes, public_values, _ = generate_sp1_proof(
+            contract_proof, _, __ = generate_sp1_proof(
                 other_key, msg_hash, other_pubkey
             )
         finally:
@@ -293,8 +284,8 @@ class TestRealProverBinaryFast:
             else:
                 os.environ["SP1_PROVER"] = old_val
 
-        tx = contract.functions.anchorEventWithZKProof(
-            prefix_b32, sn, said_b32, public_values, proof_bytes
+        tx = contract.functions.anchorEvent(
+            prefix_b32, sn, said_b32, sp1_verifier, contract_proof
         ).build_transaction({
             "from": backer_account.address,
             "nonce": w3.eth.get_transaction_count(backer_account.address, "pending"),
@@ -305,7 +296,7 @@ class TestRealProverBinaryFast:
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
         assert receipt.status == 0, (
-            "anchorEventWithZKProof should revert when public values carry wrong pubkey"
+            "anchorEvent should revert when public values carry an unapproved pubkey"
         )
 
 
@@ -335,6 +326,7 @@ class TestRealGroth16Proof:
         self, w3, anvil_process, backer_account
     ):
         """Full cryptographic pipeline: local Groth16 → SP1VerifierGroth16 → KERIBacker."""
+        from eth_abi import decode as abi_decode
         from eth_account import Account
 
         prefix_b32 = Web3.keccak(text="groth16_prefix")
@@ -347,14 +339,16 @@ class TestRealGroth16Proof:
         )
         msg_hash = Web3.keccak(encoded)
 
-        # Generate real Groth16 proof (SP1_PROVER defaults to "local")
-        proof_bytes, public_values, vkey = generate_sp1_proof(
+        # Generate real Groth16 proof (SP1_PROVER defaults to "cpu")
+        contract_proof, public_values, vkey = generate_sp1_proof(
             ED25519_SIGNING_KEY,
             msg_hash,
             BACKER_PUBKEY_BYTES,
         )
 
-        assert len(proof_bytes) > 0, (
+        # Verify real proof was generated (inner proof_bytes must be non-empty)
+        _, inner_pb = abi_decode(["bytes", "bytes"], contract_proof)
+        assert len(inner_pb) > 0, (
             "Real Groth16 proof should be non-empty. "
             "If you see empty bytes, the prover ran in mock mode."
         )
@@ -363,38 +357,61 @@ class TestRealGroth16Proof:
         assert public_values[32:] == msg_hash
 
         # Deploy real SP1VerifierGroth16 (v6.0.0)
-        verifier_address = _deploy_contract(
+        sp1_verifier_address = _deploy_contract(
             CONTRACTS_DIR,
             ANVIL_RPC_URL,
             ANVIL_DEPLOYER_KEY,
             "lib/sp1-contracts/contracts/src/v6.0.0/SP1VerifierGroth16.sol:SP1Verifier",
         )
 
-        # Deploy fresh KERIBacker
-        contract_address = _deploy_contract(
+        # Deploy SP1KERIVerifier with the real Groth16 verifier and real vkey
+        sp1_vkey_bytes = bytes.fromhex(vkey.replace("0x", ""))
+        sp1_keri_verifier_address = _deploy_contract(
+            CONTRACTS_DIR,
+            ANVIL_RPC_URL,
+            ANVIL_DEPLOYER_KEY,
+            "src/SP1KERIVerifier.sol:SP1KERIVerifier",
+            sp1_verifier_address,
+            "0x" + sp1_vkey_bytes.hex(),
+            ANVIL_DEPLOYER_ADDRESS,
+        )
+        sp1_keri_abi = _load_abi(CONTRACTS_DIR, "SP1KERIVerifier")
+        sp1_keri_contract = w3.eth.contract(address=sp1_keri_verifier_address, abi=sp1_keri_abi)
+
+        # Approve the test backer pubkey on SP1KERIVerifier
+        deployer = Account.from_key(ANVIL_DEPLOYER_KEY)
+        _build_and_send(
+            w3, deployer,
+            sp1_keri_contract.functions.approveBacker(BACKER_PUBKEY_BYTES),
+            gas=500_000,
+        )
+
+        # Deploy fresh KERIBacker and approve the SP1KERIVerifier
+        kb_address = _deploy_contract(
             CONTRACTS_DIR,
             ANVIL_RPC_URL,
             ANVIL_DEPLOYER_KEY,
             "src/KERIBacker.sol:KERIBacker",
-            "0x" + ED25519_PUBKEY_HEX,
+            ANVIL_DEPLOYER_ADDRESS,
         )
-        abi = _load_abi(CONTRACTS_DIR, "KERIBacker")
-        contract = w3.eth.contract(address=contract_address, abi=abi)
+        kb_abi = _load_abi(CONTRACTS_DIR, "KERIBacker")
+        kb_contract = w3.eth.contract(address=kb_address, abi=kb_abi)
+        _build_and_send(
+            w3, deployer,
+            kb_contract.functions.approveVerifier(sp1_keri_verifier_address),
+            gas=500_000,
+        )
 
-        # Configure ZK verifier with the real vkey
-        sp1_vkey_bytes = bytes.fromhex(vkey.replace("0x", ""))
-        _configure_zk_verifier(w3, contract, verifier_address, sp1_vkey_bytes, 999, backer_account)
-
-        # Anchor with real proof
+        # Anchor with real Groth16 proof
         receipt = _build_and_send(
             w3, backer_account,
-            contract.functions.anchorEventWithZKProof(
-                prefix_b32, sn, said_b32, public_values, proof_bytes
+            kb_contract.functions.anchorEvent(
+                prefix_b32, sn, said_b32, sp1_keri_verifier_address, contract_proof
             ),
             gas=2_000_000,
         )
         assert receipt.status == 1, (
-            f"anchorEventWithZKProof with real Groth16 proof reverted. "
+            f"anchorEvent with real Groth16 proof reverted. "
             f"Gas used: {receipt.gasUsed}"
         )
-        assert contract.functions.isAnchored(prefix_b32, sn, said_b32).call()
+        assert kb_contract.functions.isAnchored(prefix_b32, sn, said_b32).call()

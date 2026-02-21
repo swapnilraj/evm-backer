@@ -2,8 +2,8 @@
 """
 Python-stack integration tests for KERIBacker.sol.
 
-Behavioral tests (first-seen policy, access control, batch semantics, key
-rotation) are covered in full by Foundry (contracts/test/KERIBacker.t.sol).
+Behavioral tests (first-seen policy, access control, batch semantics) are
+covered in full by Foundry (contracts/test/KERIBacker.t.sol).
 
 These tests cover Python-specific concerns only:
   1. forge deploy + web3.py connect + signed tx via eth_account (full stack)
@@ -16,6 +16,7 @@ Reference:
   - contracts/test/KERIBacker.t.sol (behavioral coverage via Foundry)
 """
 
+from eth_abi import encode as abi_encode
 from keri.core import eventing
 from keri.core.signing import Signer
 
@@ -23,7 +24,7 @@ from nacl.signing import SigningKey
 from web3 import Web3
 
 from evm_backer.transactions import prefix_to_bytes32, said_to_bytes32
-from tests.conftest import SEED_0, _send_anchor_tx, ED25519_SIGNING_KEY
+from tests.conftest import SEED_0, _send_anchor_tx, ED25519_SIGNING_KEY, ED25519_PUBKEY_HEX
 
 
 def _build_golden_icp():
@@ -39,7 +40,9 @@ class TestPythonStackIntegration:
     Foundry covers all contract logic. These tests cover Python glue only.
     """
 
-    def test_anchor_and_query_via_python_stack(self, w3, contract, backer_account):
+    def test_anchor_and_query_via_python_stack(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """forge deploy + eth_account sign + web3.py view call.
 
         Proves the full stack: forge compiles, anvil runs, web3.py connects,
@@ -49,13 +52,17 @@ class TestPythonStackIntegration:
         prefix_b32 = prefix_to_bytes32(serder.ked["i"])
         said_b32 = said_to_bytes32(serder.said)
 
-        receipt = _send_anchor_tx(w3, contract, backer_account, prefix_b32, 0, said_b32)
+        receipt = _send_anchor_tx(
+            w3, contract, backer_account, prefix_b32, 0, said_b32, ed25519_verifier_address
+        )
         assert receipt.status == 1
 
         assert contract.functions.isAnchored(prefix_b32, 0, said_b32).call() is True
         assert contract.functions.isAnchored(prefix_b32, 0, b'\x00' * 32).call() is False
 
-    def test_batch_tuple_encoding_and_log_parsing(self, w3, contract, backer_account):
+    def test_batch_tuple_encoding_and_log_parsing(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """anchorBatch Anchor[] struct array via Python tuples + event log parsing.
 
         Proves two Python-specific behaviors:
@@ -66,15 +73,17 @@ class TestPythonStackIntegration:
             (b'\xd3' * 32, 0, b'\xe3' * 32),
             (b'\xd4' * 32, 0, b'\xe4' * 32),
         ]
-        # Sign the batch with Ed25519
-        encoded = w3.codec.encode(
-            ["(bytes32,uint64,bytes32)[]"],
-            [anchors],
-        )
+        # Compute message hash: keccak256(abi.encode(anchors))
+        encoded = w3.codec.encode(["(bytes32,uint64,bytes32)[]"], [anchors])
         msg_hash = Web3.keccak(encoded)
-        sig = ED25519_SIGNING_KEY.sign(msg_hash).signature
+        sig = ED25519_SIGNING_KEY.sign(msg_hash).signature  # 64 bytes: r || s
+        r, s = sig[:32], sig[32:]
+        pubkey_bytes = bytes.fromhex(ED25519_PUBKEY_HEX)
+        proof = abi_encode(["bytes32", "bytes32", "bytes32"], [pubkey_bytes, r, s])
 
-        tx = contract.functions.anchorBatch(anchors, sig).build_transaction({
+        tx = contract.functions.anchorBatch(
+            anchors, ed25519_verifier_address, proof
+        ).build_transaction({
             "from": backer_account.address,
             "nonce": w3.eth.get_transaction_count(backer_account.address, "pending"),
             "chainId": w3.eth.chain_id,
@@ -89,14 +98,16 @@ class TestPythonStackIntegration:
         assert len(logs) == 2, "Each anchor in the batch must emit KERIEventAnchored"
 
     def test_revert_detection(self, w3, contract, deployer_account):
-        """Invalid signature — tx is mined but receipt.status == 0.
+        """Unapproved verifier — tx is mined but receipt.status == 0.
 
         Proves web3.py correctly surfaces failed txs: send_raw_transaction
         succeeds (tx enters mempool), but the mined receipt has status 0.
         """
-        bad_sig = b'\x00' * 64
+        unregistered_verifier = "0x0000000000000000000000000000000000000000"
         tx = contract.functions.anchorEvent(
-            b'\xf0' * 32, 0, b'\xf1' * 32, bad_sig
+            b'\xf0' * 32, 0, b'\xf1' * 32,
+            unregistered_verifier,
+            b'',  # proof doesn't matter — verifier check fails first
         ).build_transaction({
             "from": deployer_account.address,
             "nonce": w3.eth.get_transaction_count(deployer_account.address, "pending"),
@@ -107,4 +118,4 @@ class TestPythonStackIntegration:
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
 
-        assert receipt.status == 0, "Invalid Ed25519 signature must revert"
+        assert receipt.status == 0, "Unapproved verifier must revert"

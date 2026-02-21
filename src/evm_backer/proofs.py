@@ -7,7 +7,7 @@ SP1 ZK proof generation for Ed25519 verification.
 
 Two modes:
 - generate_sp1_proof(): calls the sp1-prover binary (requires SP1 toolchain)
-- make_mock_sp1_proof(): returns empty proof bytes for use with SP1MockVerifier in tests
+- make_mock_sp1_proof(): returns encoded proof bytes for use with SP1MockVerifier
 
 Reference:
   - evm-backer-spec.md section 3.3 (ZK Proof Integration)
@@ -48,14 +48,14 @@ def generate_sp1_proof(
         pubkey_bytes: 32-byte Ed25519 public key (backer's verify key).
 
     Returns:
-        (proof_bytes, public_values, vkey) where:
-          - proof_bytes: the SP1 Groth16 proof (variable length)
+        (contract_proof, public_values, vkey) where:
+          - contract_proof: abi.encode(publicValues, proofBytes) for SP1KERIVerifier
           - public_values: 64 bytes = pubkey (32) || msg_hash (32)
           - vkey: the SP1 program verification key as a 0x-prefixed hex string
     """
     sig = signing_key.sign(message_hash).signature  # 64 bytes
 
-    # SP1_PROVER controls the proving mode: "local" (real Groth16, default),
+    # SP1_PROVER controls the proving mode: "cpu" (real Groth16, default),
     # "mock" (instant, guest executes but proof is empty), "network" (Succinct's
     # remote network). The subprocess inherits the caller's environment; we only
     # set a default if SP1_PROVER is not already present.
@@ -82,11 +82,11 @@ def generate_sp1_proof(
         line for line in reversed(result.stdout.splitlines()) if line.strip().startswith("{")
     )
     data = json.loads(json_line)
-    return (
-        bytes.fromhex(data["proof"]),
-        bytes.fromhex(data["publicValues"]),
-        data["vkey"],
-    )
+    proof_bytes = bytes.fromhex(data["proof"])
+    public_values = bytes.fromhex(data["publicValues"])
+    # Encode as expected by SP1KERIVerifier.verify()
+    contract_proof = encode(["bytes", "bytes"], [public_values, proof_bytes])
+    return (contract_proof, public_values, data["vkey"])
 
 
 def make_mock_sp1_proof(backer_pubkey: bytes, message_hash: bytes) -> tuple[bytes, bytes]:
@@ -96,14 +96,18 @@ def make_mock_sp1_proof(backer_pubkey: bytes, message_hash: bytes) -> tuple[byte
     proofBytes.length == 0. It does NOT verify the proof — it only
     checks the public values format.
 
+    The contract_proof is encoded as abi.encode(publicValues, b"") which
+    is the format SP1KERIVerifier.verify() expects.
+
     Args:
         backer_pubkey: 32-byte Ed25519 public key (bytes32).
         message_hash: 32-byte message hash (bytes32).
 
     Returns:
-        (proof_bytes, public_values) where:
-          - proof_bytes: b"" (empty — required by SP1MockVerifier)
+        (contract_proof, public_values) where:
+          - contract_proof: abi.encode(publicValues, b"") for anchorEvent/anchorBatch
           - public_values: 64 bytes = abi.encode(bytes32, bytes32)
     """
     public_values = encode(["bytes32", "bytes32"], [backer_pubkey, message_hash])
-    return b"", public_values
+    contract_proof = encode(["bytes", "bytes"], [public_values, b""])
+    return contract_proof, public_values

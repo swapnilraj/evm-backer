@@ -21,6 +21,7 @@ import subprocess
 import time
 
 import pytest
+from eth_abi import encode as abi_encode
 from nacl.signing import SigningKey
 from web3 import Web3
 
@@ -32,7 +33,7 @@ ANVIL_HOST = "127.0.0.1"
 ANVIL_PORT = 8545
 ANVIL_RPC_URL = f"http://{ANVIL_HOST}:{ANVIL_PORT}"
 
-# anvil's deterministic account #0 (default deployer)
+# anvil's deterministic account #0 (default deployer, also acts as contract owner)
 # Private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 ANVIL_DEPLOYER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 ANVIL_DEPLOYER_ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -148,30 +149,88 @@ def w3(anvil_process):
 
 
 # ---------------------------------------------------------------------------
+# Deployment helper
+# ---------------------------------------------------------------------------
+
+def _forge_create(contract_path, *constructor_args):
+    """Deploy a contract via forge create and return the deployed address."""
+    cmd = [
+        "forge", "create",
+        "--root", CONTRACTS_DIR,
+        "--rpc-url", ANVIL_RPC_URL,
+        "--private-key", ANVIL_DEPLOYER_KEY,
+        "--broadcast",
+        contract_path,
+    ]
+    if constructor_args:
+        cmd += ["--constructor-args"] + list(constructor_args)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        pytest.fail(
+            f"forge create {contract_path} failed:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+    for line in result.stdout.splitlines():
+        if "Deployed to:" in line:
+            return line.split("Deployed to:")[-1].strip()
+
+    pytest.fail(f"Could not parse address from forge create output:\n{result.stdout}")
+
+
+def _load_abi(contract_name):
+    """Load a contract ABI from forge artifacts."""
+    abi_path = os.path.join(CONTRACTS_DIR, "out", f"{contract_name}.sol", f"{contract_name}.json")
+    with open(abi_path) as f:
+        return json.load(f)["abi"]
+
+
+def _call_contract(w3, address, abi, fn_name, *args):
+    """Send a state-changing transaction from the deployer account."""
+    from eth_account import Account
+
+    deployer = Account.from_key(ANVIL_DEPLOYER_KEY)
+    contract = w3.eth.contract(address=address, abi=abi)
+    fn = getattr(contract.functions, fn_name)(*args)
+    tx = fn.build_transaction({
+        "from": deployer.address,
+        "nonce": w3.eth.get_transaction_count(deployer.address, "pending"),
+        "chainId": w3.eth.chain_id,
+        "gas": 1_500_000,
+    })
+    signed = deployer.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    assert receipt.status == 1, f"{fn_name} failed (status=0)"
+    return receipt
+
+
+# ---------------------------------------------------------------------------
 # Contract deployment fixture (session-scoped)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
 def deployed_contract(w3):
-    """Compile and deploy KERIBacker.sol to anvil using forge.
+    """Compile and deploy Ed25519Verifier + KERIBacker to anvil.
 
-    Uses `forge create` to compile the contract from source and deploy it
-    in a single step. The backer address (anvil account #1) is passed as
-    the constructor argument.
+    Deployment order:
+      1. forge build (compile all contracts)
+      2. Deploy Ed25519Verifier(deployer_address)
+      3. approveBacker(ED25519_PUBKEY) on Ed25519Verifier
+      4. Deploy KERIBacker(deployer_address)
+      5. approveVerifier(ed25519_verifier_address) on KERIBacker
 
     Returns a dict with:
-        - address: the deployed contract address
-        - abi: the contract ABI (parsed from forge output)
-        - contract: a web3.py Contract instance bound to the address
+        - address: the deployed KERIBacker address
+        - abi: the KERIBacker ABI
+        - contract: a web3.py Contract instance for KERIBacker
+        - ed25519_verifier_address: the deployed Ed25519Verifier address
     """
-    # Compile the contract to get the ABI
+    # Compile all contracts
     compile_result = subprocess.run(
-        [
-            "forge", "build",
-            "--root", CONTRACTS_DIR,
-        ],
-        capture_output=True,
-        text=True,
+        ["forge", "build", "--root", CONTRACTS_DIR],
+        capture_output=True, text=True,
     )
     if compile_result.returncode != 0:
         pytest.fail(
@@ -179,55 +238,35 @@ def deployed_contract(w3):
             f"stderr: {compile_result.stderr}"
         )
 
-    # Deploy using forge create — constructor takes bytes32 Ed25519 pubkey
-    pubkey_arg = "0x" + ED25519_PUBKEY_HEX
-    deploy_result = subprocess.run(
-        [
-            "forge", "create",
-            "--root", CONTRACTS_DIR,
-            "--rpc-url", ANVIL_RPC_URL,
-            "--private-key", ANVIL_DEPLOYER_KEY,
-            "--broadcast",
-            "src/KERIBacker.sol:KERIBacker",
-            "--constructor-args", pubkey_arg,
-        ],
-        capture_output=True,
-        text=True,
+    # Deploy Ed25519Verifier with deployer as owner
+    ed25519_verifier_address = _forge_create(
+        "src/Ed25519Verifier.sol:Ed25519Verifier",
+        ANVIL_DEPLOYER_ADDRESS,
     )
-    if deploy_result.returncode != 0:
-        pytest.fail(
-            f"forge create failed:\nstdout: {deploy_result.stdout}\n"
-            f"stderr: {deploy_result.stderr}"
-        )
 
-    # Parse the deployed address from forge create output
-    # forge create outputs: "Deployed to: 0x..."
-    contract_address = None
-    for line in deploy_result.stdout.splitlines():
-        if "Deployed to:" in line:
-            contract_address = line.split("Deployed to:")[-1].strip()
-            break
+    # Approve the test Ed25519 pubkey
+    ed25519_verifier_abi = _load_abi("Ed25519Verifier")
+    pubkey_bytes32 = bytes.fromhex(ED25519_PUBKEY_HEX)
+    _call_contract(w3, ed25519_verifier_address, ed25519_verifier_abi,
+                   "approveBacker", pubkey_bytes32)
 
-    if contract_address is None:
-        pytest.fail(
-            f"Could not parse contract address from forge create output:\n"
-            f"{deploy_result.stdout}"
-        )
-
-    # Load the ABI from forge's output artifacts
-    abi_path = os.path.join(
-        CONTRACTS_DIR, "out", "KERIBacker.sol", "KERIBacker.json"
+    # Deploy KERIBacker with deployer as owner
+    kb_address = _forge_create(
+        "src/KERIBacker.sol:KERIBacker",
+        ANVIL_DEPLOYER_ADDRESS,
     )
-    with open(abi_path) as f:
-        artifact = json.load(f)
 
-    abi = artifact["abi"]
-    contract = w3.eth.contract(address=contract_address, abi=abi)
+    # Approve the Ed25519Verifier
+    kb_abi = _load_abi("KERIBacker")
+    _call_contract(w3, kb_address, kb_abi, "approveVerifier", ed25519_verifier_address)
+
+    contract = w3.eth.contract(address=kb_address, abi=kb_abi)
 
     return {
-        "address": contract_address,
-        "abi": abi,
+        "address": kb_address,
+        "abi": kb_abi,
         "contract": contract,
+        "ed25519_verifier_address": ed25519_verifier_address,
     }
 
 
@@ -282,11 +321,11 @@ def backer_hab(keri_habery):
 # Shared test helpers
 # ---------------------------------------------------------------------------
 
-def _send_anchor_tx(w3, contract, backer_account, prefix_b32, sn, said_b32):
+def _send_anchor_tx(w3, contract, backer_account, prefix_b32, sn, said_b32, verifier_address):
     """Submit an anchorEvent transaction signed by the backer.
 
-    The contract requires an Ed25519 signature over
-    keccak256(abi.encode(prefix, sn, eventSAID)).
+    The contract requires an approved verifier and a matching proof.
+    For the Ed25519 path: proof = abi.encode(backerPubKey, r, s).
     """
     # Compute the message hash the same way the contract does
     encoded = w3.codec.encode(
@@ -294,10 +333,14 @@ def _send_anchor_tx(w3, contract, backer_account, prefix_b32, sn, said_b32):
         [prefix_b32, sn, said_b32],
     )
     msg_hash = Web3.keccak(encoded)
-    sig = ED25519_SIGNING_KEY.sign(msg_hash).signature
+    sig = ED25519_SIGNING_KEY.sign(msg_hash).signature  # 64 bytes
+    r = sig[:32]
+    s = sig[32:]
+    pubkey_bytes = bytes.fromhex(ED25519_PUBKEY_HEX)
+    proof = abi_encode(["bytes32", "bytes32", "bytes32"], [pubkey_bytes, r, s])
 
     tx = contract.functions.anchorEvent(
-        prefix_b32, sn, said_b32, sig
+        prefix_b32, sn, said_b32, verifier_address, proof
     ).build_transaction({
         "from": backer_account.address,
         "nonce": w3.eth.get_transaction_count(backer_account.address, "pending"),
@@ -323,6 +366,12 @@ def contract_address(deployed_contract):
 def contract(deployed_contract):
     """Shortcut to get the web3.py Contract instance."""
     return deployed_contract["contract"]
+
+
+@pytest.fixture(scope="session")
+def ed25519_verifier_address(deployed_contract):
+    """Shortcut to get the deployed Ed25519Verifier address."""
+    return deployed_contract["ed25519_verifier_address"]
 
 
 @pytest.fixture(scope="session")
@@ -369,120 +418,53 @@ def mock_sp1_verifier(w3, deployed_contract):
 
     Depends on deployed_contract to ensure forge build has already run.
     """
-    deploy_result = subprocess.run(
-        [
-            "forge", "create",
-            "--root", CONTRACTS_DIR,
-            "--rpc-url", ANVIL_RPC_URL,
-            "--private-key", ANVIL_DEPLOYER_KEY,
-            "--broadcast",
-            "lib/sp1-contracts/contracts/src/SP1MockVerifier.sol:SP1MockVerifier",
-        ],
-        capture_output=True,
-        text=True,
+    mock_address = _forge_create(
+        "lib/sp1-contracts/contracts/src/SP1MockVerifier.sol:SP1MockVerifier",
     )
-    if deploy_result.returncode != 0:
-        pytest.fail(
-            f"forge create SP1MockVerifier failed:\nstdout: {deploy_result.stdout}\n"
-            f"stderr: {deploy_result.stderr}"
-        )
-
-    mock_address = None
-    for line in deploy_result.stdout.splitlines():
-        if "Deployed to:" in line:
-            mock_address = line.split("Deployed to:")[-1].strip()
-            break
-
-    if mock_address is None:
-        pytest.fail(
-            f"Could not parse SP1MockVerifier address from:\n{deploy_result.stdout}"
-        )
-
     return mock_address
 
 
 @pytest.fixture(scope="session")
 def contract_with_zk(w3, mock_sp1_verifier):
-    """Deploy a fresh KERIBacker and configure the SP1 ZK verifier.
+    """Deploy SP1KERIVerifier + a fresh KERIBacker for ZK path tests.
 
-    Calls setZKVerifier(mockAddr, bytes32(0), sig, nonce=42) so that
-    anchorEventWithZKProof and anchorBatchWithZKProof can be tested
-    without the real SP1 prover.
+    Deployment order:
+      1. Deploy SP1KERIVerifier(mock_sp1_addr, bytes32(0), deployer_addr)
+      2. approveBacker(ED25519_PUBKEY) on SP1KERIVerifier
+      3. Deploy fresh KERIBacker(deployer_addr)
+      4. approveVerifier(sp1_keri_verifier_addr) on KERIBacker
 
-    Returns a dict with 'address', 'abi', 'contract', 'mock_sp1_address'.
+    Returns a dict with 'address', 'abi', 'contract', 'sp1_keri_verifier_address'.
     """
-    from eth_account import Account
+    # Deploy SP1KERIVerifier with deployer as owner, bytes32(0) vkey (MockVerifier ignores it)
+    sp1_keri_verifier_address = _forge_create(
+        "src/SP1KERIVerifier.sol:SP1KERIVerifier",
+        mock_sp1_verifier,
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        ANVIL_DEPLOYER_ADDRESS,
+    )
+
+    # Approve the test Ed25519 pubkey on the SP1KERIVerifier
+    sp1_keri_verifier_abi = _load_abi("SP1KERIVerifier")
+    pubkey_bytes32 = bytes.fromhex(ED25519_PUBKEY_HEX)
+    _call_contract(w3, sp1_keri_verifier_address, sp1_keri_verifier_abi,
+                   "approveBacker", pubkey_bytes32)
 
     # Deploy fresh KERIBacker for ZK tests (separate from the one in deployed_contract)
-    pubkey_arg = "0x" + ED25519_PUBKEY_HEX
-    deploy_result = subprocess.run(
-        [
-            "forge", "create",
-            "--root", CONTRACTS_DIR,
-            "--rpc-url", ANVIL_RPC_URL,
-            "--private-key", ANVIL_DEPLOYER_KEY,
-            "--broadcast",
-            "src/KERIBacker.sol:KERIBacker",
-            "--constructor-args", pubkey_arg,
-        ],
-        capture_output=True,
-        text=True,
+    kb_address = _forge_create(
+        "src/KERIBacker.sol:KERIBacker",
+        ANVIL_DEPLOYER_ADDRESS,
     )
-    if deploy_result.returncode != 0:
-        pytest.fail(
-            f"forge create KERIBacker (ZK) failed:\nstdout: {deploy_result.stdout}\n"
-            f"stderr: {deploy_result.stderr}"
-        )
 
-    contract_address = None
-    for line in deploy_result.stdout.splitlines():
-        if "Deployed to:" in line:
-            contract_address = line.split("Deployed to:")[-1].strip()
-            break
+    # Approve the SP1KERIVerifier
+    kb_abi = _load_abi("KERIBacker")
+    _call_contract(w3, kb_address, kb_abi, "approveVerifier", sp1_keri_verifier_address)
 
-    if contract_address is None:
-        pytest.fail(
-            f"Could not parse KERIBacker address from:\n{deploy_result.stdout}"
-        )
-
-    abi_path = os.path.join(CONTRACTS_DIR, "out", "KERIBacker.sol", "KERIBacker.json")
-    with open(abi_path) as f:
-        artifact = json.load(f)
-
-    abi = artifact["abi"]
-    contract = w3.eth.contract(address=contract_address, abi=abi)
-
-    # Configure ZK verifier: setZKVerifier(mockAddr, bytes32(0), sig, nonce=42)
-    # Message: keccak256(abi.encodePacked(address mockAddr, bytes32 vkey, uint256 nonce))
-    zk_nonce = 42
-    sp1_vkey = b'\x00' * 32  # bytes32(0)
-    mock_addr_bytes = bytes.fromhex(mock_sp1_verifier.lstrip("0x").zfill(40))
-
-    # abi.encodePacked(address, bytes32, uint256) = 20 + 32 + 32 = 84 bytes
-    packed = mock_addr_bytes + sp1_vkey + zk_nonce.to_bytes(32, "big")
-    msg_hash = Web3.keccak(packed)
-    sig = ED25519_SIGNING_KEY.sign(msg_hash).signature
-
-    backer_acc = Account.from_key(ANVIL_BACKER_KEY)
-    tx = contract.functions.setZKVerifier(
-        mock_sp1_verifier, sp1_vkey, sig, zk_nonce
-    ).build_transaction({
-        "from": backer_acc.address,
-        "nonce": w3.eth.get_transaction_count(backer_acc.address, "pending"),
-        "chainId": w3.eth.chain_id,
-        "gas": 1_500_000,  # Ed25519.verify costs ~692k gas
-    })
-    signed_tx = backer_acc.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    assert receipt.status == 1, (
-        f"setZKVerifier failed (status=0) for contract at {contract_address}. "
-        f"Gas used: {receipt.gasUsed}"
-    )
+    contract = w3.eth.contract(address=kb_address, abi=kb_abi)
 
     return {
-        "address": contract_address,
-        "abi": abi,
+        "address": kb_address,
+        "abi": kb_abi,
         "contract": contract,
-        "mock_sp1_address": mock_sp1_verifier,
+        "sp1_keri_verifier_address": sp1_keri_verifier_address,
     }

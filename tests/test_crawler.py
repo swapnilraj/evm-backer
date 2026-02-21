@@ -36,7 +36,9 @@ def _mine_blocks(w3: Web3, n: int):
 class TestConfirmationDepth:
     """Test that confirmation depth is correctly tracked using real block numbers."""
 
-    def test_event_not_confirmed_at_zero_depth(self, w3, contract, backer_account):
+    def test_event_not_confirmed_at_zero_depth(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """An event that was just anchored has zero confirmations.
         It should NOT be considered confirmed yet.
         """
@@ -45,7 +47,7 @@ class TestConfirmationDepth:
 
         receipt = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix, 0, said,
+            prefix, 0, said, ed25519_verifier_address,
         )
         anchor_block = receipt.blockNumber
         current_block = w3.eth.block_number
@@ -55,7 +57,9 @@ class TestConfirmationDepth:
             f"Event should not be confirmed at depth {depth}"
         )
 
-    def test_event_confirmed_after_sufficient_blocks(self, w3, contract, backer_account):
+    def test_event_confirmed_after_sufficient_blocks(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """After CONFIRMATION_DEPTH blocks pass, the event should be considered confirmed.
 
         We mine blocks manually to simulate time passing.
@@ -65,7 +69,7 @@ class TestConfirmationDepth:
 
         receipt = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix, 0, said,
+            prefix, 0, said, ed25519_verifier_address,
         )
         anchor_block = receipt.blockNumber
 
@@ -82,14 +86,16 @@ class TestConfirmationDepth:
         # The event is still anchored on-chain (immutable)
         assert contract.functions.isAnchored(prefix, 0, said).call() is True
 
-    def test_confirmation_depth_boundary(self, w3, contract, backer_account):
+    def test_confirmation_depth_boundary(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """Test the exact boundary: at depth=11 not confirmed, at depth=12 confirmed."""
         prefix = b'\x12' * 32
         said = b'\x22' * 32
 
         receipt = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix, 0, said,
+            prefix, 0, said, ed25519_verifier_address,
         )
         anchor_block = receipt.blockNumber
 
@@ -109,7 +115,9 @@ class TestConfirmationDepth:
 class TestBlockHashTracking:
     """Test that block hashes can be used to detect reorgs."""
 
-    def test_block_hash_is_stable(self, w3, contract, backer_account):
+    def test_block_hash_is_stable(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """After anchoring, the block hash of the anchoring block should
         remain consistent when queried again (no reorg on anvil).
         """
@@ -118,7 +126,7 @@ class TestBlockHashTracking:
 
         receipt = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix, 0, said,
+            prefix, 0, said, ed25519_verifier_address,
         )
         anchor_block_num = receipt.blockNumber
         anchor_block = w3.eth.get_block(anchor_block_num)
@@ -136,7 +144,7 @@ class TestBlockHashTracking:
         )
 
     def test_transaction_receipt_block_number_matches_anchor(
-        self, w3, contract, backer_account
+        self, w3, contract, backer_account, ed25519_verifier_address
     ):
         """The transaction receipt's blockNumber must match what getAnchor returns."""
         prefix = b'\x14' * 32
@@ -144,7 +152,7 @@ class TestBlockHashTracking:
 
         receipt = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix, 0, said,
+            prefix, 0, said, ed25519_verifier_address,
         )
 
         # getAnchor returns (eventSAID, blockNumber, exists)
@@ -170,7 +178,9 @@ class TestReorgDetection:
     3. If the hash changes, requeue the affected events
     """
 
-    def test_reorg_detection_via_block_hash_comparison(self, w3, contract, backer_account):
+    def test_reorg_detection_via_block_hash_comparison(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """Demonstrate the reorg detection pattern:
         store a block hash, re-query it, compare.
 
@@ -182,7 +192,7 @@ class TestReorgDetection:
 
         receipt = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix, 0, said,
+            prefix, 0, said, ed25519_verifier_address,
         )
         anchor_block_num = receipt.blockNumber
 
@@ -219,7 +229,9 @@ class TestTimeoutDepth:
             f"CONFIRMATION_DEPTH ({CONFIRMATION_DEPTH})"
         )
 
-    def test_event_pending_beyond_timeout_depth(self, w3, contract, backer_account):
+    def test_event_pending_beyond_timeout_depth(
+        self, w3, contract, backer_account, ed25519_verifier_address
+    ):
         """If more than TIMEOUT_DEPTH blocks pass and the event is still anchored,
         the event should be requeued.
 
@@ -233,7 +245,7 @@ class TestTimeoutDepth:
 
         receipt = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix, 0, said,
+            prefix, 0, said, ed25519_verifier_address,
         )
         anchor_block = receipt.blockNumber
 
@@ -256,7 +268,7 @@ class TestMultipleEventsConfirmation:
     """Test confirmation tracking with multiple events across multiple blocks."""
 
     def test_events_at_different_blocks_confirm_at_different_times(
-        self, w3, contract, backer_account
+        self, w3, contract, backer_account, ed25519_verifier_address
     ):
         """Events anchored in different blocks should reach confirmation
         depth at different current block numbers.
@@ -266,7 +278,7 @@ class TestMultipleEventsConfirmation:
         said_a = b'\x27' * 32
         receipt_a = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix_a, 0, said_a,
+            prefix_a, 0, said_a, ed25519_verifier_address,
         )
         block_a = receipt_a.blockNumber
 
@@ -277,7 +289,7 @@ class TestMultipleEventsConfirmation:
         said_b = b'\x28' * 32
         receipt_b = _send_anchor_tx(
             w3, contract, backer_account,
-            prefix_b, 0, said_b,
+            prefix_b, 0, said_b, ed25519_verifier_address,
         )
         block_b = receipt_b.blockNumber
 
@@ -312,13 +324,13 @@ class TestCrawlerRevertDetection:
 
         deployer = Account.from_key(ANVIL_DEPLOYER_KEY)
 
-        # Try to anchor with a bad signature — should revert
+        # Try to anchor with an unregistered verifier — should revert
         prefix = b'\xF1' * 32
         said = b'\xF2' * 32
-        bad_sig = b'\x00' * 64
+        unregistered_verifier = "0x0000000000000000000000000000000000000000"
         try:
             tx = contract.functions.anchorEvent(
-                prefix, 0, said, bad_sig
+                prefix, 0, said, unregistered_verifier, b'',
             ).build_transaction({
                 "from": deployer.address,
                 "nonce": w3.eth.get_transaction_count(deployer.address, "pending"),

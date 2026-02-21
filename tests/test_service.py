@@ -22,7 +22,7 @@ from evm_backer.event_queue import Queuer
 from evm_backer.http_server import create_app
 from evm_backer.service import ServiceLoop
 from evm_backer.transactions import prefix_to_bytes32, said_to_bytes32
-from tests.conftest import ED25519_SIGNING_KEY
+from tests.conftest import ED25519_SIGNING_KEY, ED25519_PUBKEY_HEX
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +163,16 @@ class TestServiceLoop:
 class TestFlushLoop:
     """Test that the service loop flushes the queue to chain."""
 
-    def test_flush_submits_queued_event(self, w3, contract, backer_account, keri_habery, backer_hab):
+    def test_flush_submits_queued_event(
+        self, w3, contract, backer_account, keri_habery, backer_hab, ed25519_verifier_address
+    ):
         """Enqueue an event, then _tick() flushes and submits it to chain."""
-        queuer = Queuer(w3=w3, contract=contract, backer_account=backer_account, signing_key=ED25519_SIGNING_KEY)
+        queuer = Queuer(
+            w3=w3, contract=contract, backer_account=backer_account,
+            signing_key=ED25519_SIGNING_KEY,
+            verifier_address=ed25519_verifier_address,
+            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+        )
         crawler = Crawler(w3=w3, queuer=queuer)
 
         kevery_components = setup_kevery(keri_habery)
@@ -208,13 +215,18 @@ class TestFlushLoop:
 class TestFullServicePipeline:
     """Test the full pipeline from enqueue through flush to on-chain verification."""
 
-    def test_enqueue_flush_verify(self, w3, contract, backer_account):
+    def test_enqueue_flush_verify(self, w3, contract, backer_account, ed25519_verifier_address):
         """Direct enqueue + flush + on-chain verification (no HTTP involved)."""
         prefix_qb64 = "BServicePipelineTest00000000000000000000000"
         said_qb64 = "EServicePipelineTestSaid0000000000000000000"
         sn = 0
 
-        queuer = Queuer(w3=w3, contract=contract, backer_account=backer_account, signing_key=ED25519_SIGNING_KEY)
+        queuer = Queuer(
+            w3=w3, contract=contract, backer_account=backer_account,
+            signing_key=ED25519_SIGNING_KEY,
+            verifier_address=ed25519_verifier_address,
+            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+        )
         queuer.enqueue(prefix_qb64, sn, said_qb64)
         tx_hash = queuer.flush()
         assert tx_hash is not None

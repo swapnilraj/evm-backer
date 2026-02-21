@@ -5,9 +5,9 @@ evm_backer.transactions module
 
 Ethereum transaction construction and submission for the KERIBacker contract.
 
-The contract uses Ed25519 signature verification for access control (C1 fix).
-Each batch is signed with the backer's Ed25519 key and the signature is passed
-alongside the anchors in the anchorBatch call.
+The contract delegates verification to modular IKERIVerifier contracts.
+For the Ed25519 path, proof = abi.encode(backerPubKey, r, s).
+For the SP1 ZK path, proof = abi.encode(publicValues, proofBytes).
 
 Reference:
   - evm-backer-spec.md section 3 (Smart Contract)
@@ -16,6 +16,7 @@ Reference:
 
 import logging
 
+from eth_abi import encode as abi_encode
 from nacl.signing import SigningKey
 from web3 import Web3
 
@@ -89,16 +90,19 @@ def ed25519_sign(signing_key, message):
     return signing_key(message)
 
 
-def build_anchor_tx(w3, contract, backer_account, anchors, signing_key=None):
-    """Build an anchorBatch transaction for a list of anchor tuples.
+def build_anchor_tx(
+    w3, contract, backer_account, anchors,
+    signing_key=None, verifier_address=None, backer_pubkey_bytes=None
+):
+    """Build an anchorBatch transaction using Ed25519 verification.
 
     Each anchor is a tuple of (prefix_bytes32, sn, said_bytes32).
 
     Uses EIP-1559 (type-2) fee estimation when the chain supports it,
     with a fallback to a fixed gas limit if estimation fails.
 
-    The contract requires an Ed25519 signature over keccak256(abi.encode(anchors)).
-    If signing_key is provided, the signature is computed and included.
+    The proof is abi.encode(backerPubKey, r, s) where (r, s) is the
+    Ed25519 signature over keccak256(abi.encode(anchors)).
 
     Args:
         w3: Web3 instance connected to an Ethereum node.
@@ -106,21 +110,26 @@ def build_anchor_tx(w3, contract, backer_account, anchors, signing_key=None):
         backer_account: eth_account.Account for the gas payer (secp256k1 signer).
         anchors: list of (bytes32, int, bytes32) tuples.
         signing_key: nacl.signing.SigningKey for Ed25519 signing.
+        verifier_address: Address of the approved Ed25519Verifier contract.
+        backer_pubkey_bytes: 32-byte Ed25519 public key (bytes32).
 
     Returns:
         A signed transaction ready for submission.
     """
-    # Compute Ed25519 signature over the batch hash
-    if signing_key is not None:
-        # ABI-encode the anchors array the same way Solidity does
+    # Compute Ed25519 proof over the batch hash
+    if signing_key is not None and verifier_address is not None and backer_pubkey_bytes is not None:
         encoded = w3.codec.encode(
             ["(bytes32,uint64,bytes32)[]"],
             [anchors],
         )
         msg_hash = Web3.keccak(encoded)
         sig = ed25519_sign(signing_key, msg_hash)
+        r = sig[:32]
+        s = sig[32:]
+        proof = abi_encode(["bytes32", "bytes32", "bytes32"], [backer_pubkey_bytes, r, s])
     else:
-        sig = b""
+        proof = b""
+        verifier_address = verifier_address or "0x0000000000000000000000000000000000000000"
 
     tx_params = {
         "from": backer_account.address,
@@ -137,9 +146,9 @@ def build_anchor_tx(w3, contract, backer_account, anchors, signing_key=None):
 
     # Dynamic gas estimation with buffer, fallback to hardcoded limit
     try:
-        gas_estimate = contract.functions.anchorBatch(anchors, sig).estimate_gas(
-            {"from": backer_account.address}
-        )
+        gas_estimate = contract.functions.anchorBatch(
+            anchors, verifier_address, proof
+        ).estimate_gas({"from": backer_account.address})
         tx_params["gas"] = int(gas_estimate * GAS_ESTIMATE_BUFFER)
     except Exception:
         logger.warning(
@@ -147,32 +156,41 @@ def build_anchor_tx(w3, contract, backer_account, anchors, signing_key=None):
         )
         tx_params["gas"] = FALLBACK_GAS_LIMIT
 
-    tx = contract.functions.anchorBatch(anchors, sig).build_transaction(tx_params)
+    tx = contract.functions.anchorBatch(
+        anchors, verifier_address, proof
+    ).build_transaction(tx_params)
     signed = backer_account.sign_transaction(tx)
     return signed
 
 
-def build_anchor_tx_with_sp1_proof(w3, contract, backer_account, anchors, public_values, proof_bytes):
-    """Build an anchorBatchWithZKProof transaction using SP1 ZK proof verification.
+def build_anchor_tx_with_sp1_proof(
+    w3, contract, backer_account, anchors,
+    public_values, proof_bytes, verifier_address
+):
+    """Build an anchorBatch transaction using SP1 ZK proof verification.
 
     The proof and public values come from generate_sp1_proof() (production) or
     make_mock_sp1_proof() (tests with SP1MockVerifier).
 
-    Uses the same EIP-1559 fee estimation as build_anchor_tx. The SP1 verifier
-    costs ~275k gas vs ~692k for on-chain Ed25519, so the fallback limit is kept
-    at 1_500_000 for safety.
+    The encoded proof passed to the contract is abi.encode(publicValues, proofBytes).
+
+    Uses the same EIP-1559 fee estimation as build_anchor_tx.
 
     Args:
         w3: Web3 instance connected to an Ethereum node.
         contract: web3.py Contract instance for KERIBacker.
         backer_account: eth_account.Account for the gas payer (secp256k1 signer).
         anchors: list of (bytes32, int, bytes32) tuples.
-        public_values: bytes — 64-byte SP1 public output (abi.encode(pubkey, msgHash)).
+        public_values: bytes — SP1 public output abi.encode(pubkey, msgHash).
         proof_bytes: bytes — SP1 proof (b"" when using SP1MockVerifier).
+        verifier_address: Address of the approved SP1KERIVerifier contract.
 
     Returns:
         A signed transaction ready for submission.
     """
+    # Encode the proof as expected by SP1KERIVerifier.verify()
+    encoded_proof = abi_encode(["bytes", "bytes"], [public_values, proof_bytes])
+
     tx_params = {
         "from": backer_account.address,
         "nonce": w3.eth.get_transaction_count(backer_account.address, "pending"),
@@ -186,8 +204,8 @@ def build_anchor_tx_with_sp1_proof(w3, contract, backer_account, anchors, public
         logger.warning("EIP-1559 fee estimation failed, using legacy gas limit")
 
     try:
-        gas_estimate = contract.functions.anchorBatchWithZKProof(
-            anchors, public_values, proof_bytes
+        gas_estimate = contract.functions.anchorBatch(
+            anchors, verifier_address, encoded_proof
         ).estimate_gas({"from": backer_account.address})
         tx_params["gas"] = int(gas_estimate * GAS_ESTIMATE_BUFFER)
     except Exception:
@@ -196,8 +214,8 @@ def build_anchor_tx_with_sp1_proof(w3, contract, backer_account, anchors, public
         )
         tx_params["gas"] = FALLBACK_GAS_LIMIT
 
-    tx = contract.functions.anchorBatchWithZKProof(
-        anchors, public_values, proof_bytes
+    tx = contract.functions.anchorBatch(
+        anchors, verifier_address, encoded_proof
     ).build_transaction(tx_params)
     signed = backer_account.sign_transaction(tx)
     return signed

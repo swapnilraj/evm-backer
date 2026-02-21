@@ -33,11 +33,16 @@ class Queuer:
     queued events are encoded and submitted as an anchorBatch transaction.
     """
 
-    def __init__(self, w3, contract, backer_account, signing_key=None):
+    def __init__(
+        self, w3, contract, backer_account, signing_key=None,
+        verifier_address=None, backer_pubkey_bytes=None
+    ):
         self.w3 = w3
         self.contract = contract
         self.backer_account = backer_account
         self.signing_key = signing_key
+        self.verifier_address = verifier_address
+        self.backer_pubkey_bytes = backer_pubkey_bytes
         self._queue = []
         self._lock = threading.Lock()
         self._pending_txs = []  # list of (tx_hash, anchors) for crawler
@@ -73,6 +78,8 @@ class Queuer:
         signed_tx = build_anchor_tx(
             self.w3, self.contract, self.backer_account, anchors,
             signing_key=self.signing_key,
+            verifier_address=self.verifier_address,
+            backer_pubkey_bytes=self.backer_pubkey_bytes,
         )
         tx_hash = submit_anchor_tx(self.w3, signed_tx)
 

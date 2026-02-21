@@ -41,10 +41,11 @@ KERI_BACKER_ABI = json.loads("""[
         "type": "function",
         "name": "anchorEvent",
         "inputs": [
-            {"name": "prefix", "type": "bytes32"},
-            {"name": "sn", "type": "uint64"},
+            {"name": "prefix",    "type": "bytes32"},
+            {"name": "sn",        "type": "uint64"},
             {"name": "eventSAID", "type": "bytes32"},
-            {"name": "sig", "type": "bytes"}
+            {"name": "verifier",  "type": "address"},
+            {"name": "proof",     "type": "bytes"}
         ],
         "outputs": [],
         "stateMutability": "nonpayable"
@@ -57,12 +58,13 @@ KERI_BACKER_ABI = json.loads("""[
                 "name": "anchors",
                 "type": "tuple[]",
                 "components": [
-                    {"name": "prefix", "type": "bytes32"},
-                    {"name": "sn", "type": "uint64"},
+                    {"name": "prefix",    "type": "bytes32"},
+                    {"name": "sn",        "type": "uint64"},
                     {"name": "eventSAID", "type": "bytes32"}
                 ]
             },
-            {"name": "sig", "type": "bytes"}
+            {"name": "verifier", "type": "address"},
+            {"name": "proof",    "type": "bytes"}
         ],
         "outputs": [],
         "stateMutability": "nonpayable"
@@ -71,14 +73,18 @@ KERI_BACKER_ABI = json.loads("""[
         "type": "function",
         "name": "isAnchored",
         "inputs": [
-            {"name": "prefix", "type": "bytes32"},
-            {"name": "sn", "type": "uint64"},
+            {"name": "prefix",    "type": "bytes32"},
+            {"name": "sn",        "type": "uint64"},
             {"name": "eventSAID", "type": "bytes32"}
         ],
         "outputs": [{"name": "", "type": "bool"}],
         "stateMutability": "view"
     }
 ]""")
+
+# Dummy values for ABI encoding tests (no real contract interaction)
+DUMMY_VERIFIER = "0x0000000000000000000000000000000000000000"
+DUMMY_PROOF = b'\x00' * 96  # abi.encode(bytes32, bytes32, bytes32) = 3 * 32 bytes
 
 
 
@@ -154,11 +160,11 @@ class TestAnchorEventCalldata:
 
         prefix_b32 = prefix_to_bytes32(prefix_qb64)
         said_b32 = said_to_bytes32(said_qb64)
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
         calldata = contract.encode_abi(
             "anchorEvent",
-            args=[prefix_b32, sn, said_b32, dummy_sig],
+            args=[prefix_b32, sn, said_b32, DUMMY_VERIFIER, dummy_sig],
         )
 
         assert calldata is not None
@@ -172,10 +178,10 @@ class TestAnchorEventCalldata:
         prefix_b32 = b'\x00' * 32
         said_b32 = b'\x01' * 32
         sn = 42
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
-        calldata1 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, dummy_sig])
-        calldata2 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, dummy_sig])
+        calldata1 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, DUMMY_VERIFIER, dummy_sig])
+        calldata2 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, DUMMY_VERIFIER, dummy_sig])
 
         assert calldata1 == calldata2
 
@@ -189,10 +195,10 @@ class TestAnchorEventCalldata:
 
         prefix_b32 = b'\x00' * 32
         said_b32 = b'\x01' * 32
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
-        calldata_low = contract.encode_abi("anchorEvent", args=[prefix_b32, 0, said_b32, dummy_sig])
-        calldata_high = contract.encode_abi("anchorEvent", args=[prefix_b32, 2**32, said_b32, dummy_sig])
+        calldata_low = contract.encode_abi("anchorEvent", args=[prefix_b32, 0, said_b32, DUMMY_VERIFIER, dummy_sig])
+        calldata_high = contract.encode_abi("anchorEvent", args=[prefix_b32, 2**32, said_b32, DUMMY_VERIFIER, dummy_sig])
 
         assert calldata_low != calldata_high
 
@@ -207,7 +213,7 @@ class TestAnchorBatchCalldata:
         """A batch with one event must produce valid calldata."""
         w3 = Web3()
         contract = w3.eth.contract(abi=KERI_BACKER_ABI)
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
         anchors = [
             (
@@ -217,7 +223,7 @@ class TestAnchorBatchCalldata:
             )
         ]
 
-        calldata = contract.encode_abi("anchorBatch", args=[anchors, dummy_sig])
+        calldata = contract.encode_abi("anchorBatch", args=[anchors, DUMMY_VERIFIER, dummy_sig])
         assert calldata is not None
         assert len(calldata) > 10
 
@@ -225,7 +231,7 @@ class TestAnchorBatchCalldata:
         """A batch with multiple events must encode all of them."""
         w3 = Web3()
         contract = w3.eth.contract(abi=KERI_BACKER_ABI)
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
         signer0 = Signer(raw=SEED_0, transferable=False)
         signer1 = Signer(raw=SEED_0, transferable=True)
@@ -246,11 +252,11 @@ class TestAnchorBatchCalldata:
             ),
         ]
 
-        calldata = contract.encode_abi("anchorBatch", args=[anchors, dummy_sig])
+        calldata = contract.encode_abi("anchorBatch", args=[anchors, DUMMY_VERIFIER, dummy_sig])
         assert calldata is not None
 
         # Batch of 2 should be longer than batch of 1
-        single = contract.encode_abi("anchorBatch", args=[anchors[:1], dummy_sig])
+        single = contract.encode_abi("anchorBatch", args=[anchors[:1], DUMMY_VERIFIER, dummy_sig])
         assert len(calldata) > len(single)
 
     def test_batch_size_matches_spec(self):
@@ -260,7 +266,7 @@ class TestAnchorBatchCalldata:
         """
         w3 = Web3()
         contract = w3.eth.contract(abi=KERI_BACKER_ABI)
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
         anchors = [
             (
@@ -271,7 +277,7 @@ class TestAnchorBatchCalldata:
             for i in range(20)
         ]
 
-        calldata = contract.encode_abi("anchorBatch", args=[anchors, dummy_sig])
+        calldata = contract.encode_abi("anchorBatch", args=[anchors, DUMMY_VERIFIER, dummy_sig])
         assert calldata is not None
         assert len(calldata) > 0
 
@@ -279,9 +285,9 @@ class TestAnchorBatchCalldata:
         """An empty batch should produce valid (minimal) calldata."""
         w3 = Web3()
         contract = w3.eth.contract(abi=KERI_BACKER_ABI)
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
-        calldata = contract.encode_abi("anchorBatch", args=[[], dummy_sig])
+        calldata = contract.encode_abi("anchorBatch", args=[[], DUMMY_VERIFIER, dummy_sig])
         assert calldata is not None
 
 
@@ -325,13 +331,13 @@ class TestGoldenCalldataFromKeriEvents:
         prefix_b32 = prefix_to_bytes32(serder.ked["i"])
         said_b32 = said_to_bytes32(serder.said)
         sn = int(serder.ked["s"])
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
         w3 = Web3()
         contract = w3.eth.contract(abi=KERI_BACKER_ABI)
 
-        calldata1 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, dummy_sig])
-        calldata2 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, dummy_sig])
+        calldata1 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, DUMMY_VERIFIER, dummy_sig])
+        calldata2 = contract.encode_abi("anchorEvent", args=[prefix_b32, sn, said_b32, DUMMY_VERIFIER, dummy_sig])
 
         assert calldata1 == calldata2, "Calldata must be deterministic"
         assert len(calldata1) > 4
@@ -347,18 +353,18 @@ class TestGoldenCalldataFromKeriEvents:
 
         prefix_b32 = prefix_to_bytes32(serder.ked["i"])
         said_b32 = said_to_bytes32(serder.said)
-        dummy_sig = b'\x00' * 64
+        dummy_sig = DUMMY_PROOF
 
         w3 = Web3()
         contract = w3.eth.contract(abi=KERI_BACKER_ABI)
 
         single = [(prefix_b32, 0, said_b32)]
-        calldata_single = contract.encode_abi("anchorBatch", args=[single, dummy_sig])
+        calldata_single = contract.encode_abi("anchorBatch", args=[single, DUMMY_VERIFIER, dummy_sig])
 
         double = [(prefix_b32, 0, said_b32), (prefix_b32, 1, said_b32)]
-        calldata_double = contract.encode_abi("anchorBatch", args=[double, dummy_sig])
+        calldata_double = contract.encode_abi("anchorBatch", args=[double, DUMMY_VERIFIER, dummy_sig])
 
-        assert calldata_single == contract.encode_abi("anchorBatch", args=[single, dummy_sig])  # deterministic
+        assert calldata_single == contract.encode_abi("anchorBatch", args=[single, DUMMY_VERIFIER, dummy_sig])  # deterministic
         assert len(calldata_double) > len(calldata_single)
 
 
@@ -369,13 +375,16 @@ class TestEIP1559FeeEstimation:
     Uses the real anvil node from conftest fixtures.
     """
 
-    def test_built_tx_has_eip1559_fields(self, w3, contract, backer_account, backer_signing_key):
+    def test_built_tx_has_eip1559_fields(
+        self, w3, contract, backer_account, backer_signing_key, ed25519_verifier_address
+    ):
         """A built transaction must include maxFeePerGas and maxPriorityFeePerGas."""
         from evm_backer.transactions import (
             build_anchor_tx,
             prefix_to_bytes32,
             said_to_bytes32,
         )
+        from tests.conftest import ED25519_PUBKEY_HEX
 
         anchors = [
             (
@@ -384,13 +393,20 @@ class TestEIP1559FeeEstimation:
                 said_to_bytes32("EEIP1559TestSaid00000000000000000000000000000"),
             )
         ]
-        signed_tx = build_anchor_tx(w3, contract, backer_account, anchors, signing_key=backer_signing_key)
+        signed_tx = build_anchor_tx(
+            w3, contract, backer_account, anchors,
+            signing_key=backer_signing_key,
+            verifier_address=ed25519_verifier_address,
+            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+        )
 
         # The signed tx object should exist and be submittable
         assert signed_tx is not None
         assert hasattr(signed_tx, "raw_transaction")
 
-    def test_dynamic_gas_estimation_not_hardcoded(self, w3, contract, backer_account, backer_signing_key):
+    def test_dynamic_gas_estimation_not_hardcoded(
+        self, w3, contract, backer_account, backer_signing_key, ed25519_verifier_address
+    ):
         """Gas limit should be dynamically estimated, not always 500_000.
 
         A single-anchor batch should use much less than 500k gas. With the 1.2x
@@ -402,6 +418,7 @@ class TestEIP1559FeeEstimation:
             said_to_bytes32,
             FALLBACK_GAS_LIMIT,
         )
+        from tests.conftest import ED25519_PUBKEY_HEX
 
         anchors = [
             (
@@ -410,7 +427,12 @@ class TestEIP1559FeeEstimation:
                 said_to_bytes32("EGasDynamicTestSaid0000000000000000000000000"),
             )
         ]
-        signed_tx = build_anchor_tx(w3, contract, backer_account, anchors, signing_key=backer_signing_key)
+        signed_tx = build_anchor_tx(
+            w3, contract, backer_account, anchors,
+            signing_key=backer_signing_key,
+            verifier_address=ed25519_verifier_address,
+            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+        )
 
         # Submit and check the receipt to see actual gas used
         from evm_backer.transactions import submit_anchor_tx
