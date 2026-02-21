@@ -30,6 +30,9 @@ jobs:
           key: forge-${{ hashFiles('contracts/src/**', 'contracts/lib/**', 'contracts/foundry.toml') }}
           restore-keys: forge-
 
+      - name: Install PyNaCl (required by sign_ed25519.py FFI helper)
+        run: pip install PyNaCl
+
       - name: Build
         run: forge build
         working-directory: contracts
