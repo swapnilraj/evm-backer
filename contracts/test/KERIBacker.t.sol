@@ -80,9 +80,8 @@ contract KERIBackerTest is KERIBackerTestBase {
     event VerifierRevoked(address indexed verifier);
 
     function setUp() public {
-        // Deploy Ed25519Verifier with this test contract as owner, pre-approve test key
-        ed25519Verifier = new Ed25519Verifier(address(this));
-        ed25519Verifier.approveBacker(BACKER_PUBKEY);
+        // Deploy permissionless Ed25519Verifier and KERIBacker
+        ed25519Verifier = new Ed25519Verifier();
 
         // Deploy KERIBacker with this test contract as owner, approve the verifier
         kb = new KERIBacker(address(this));
@@ -390,10 +389,9 @@ contract KERIBackerZKTest is KERIBackerTestBase {
     bytes32 public said3   = keccak256("event_said_3");
 
     function setUp() public {
-        // Deploy SP1MockVerifier and SP1KERIVerifier with test pubkey pre-approved
+        // Deploy SP1MockVerifier and permissionless SP1KERIVerifier
         mockSP1 = new SP1MockVerifier();
-        sp1KeriVerifier = new SP1KERIVerifier(address(mockSP1), bytes32(0), address(this));
-        sp1KeriVerifier.approveBacker(BACKER_PUBKEY);
+        sp1KeriVerifier = new SP1KERIVerifier(address(mockSP1), bytes32(0));
 
         // Deploy KERIBacker and approve the SP1 verifier
         kb = new KERIBacker(address(this));
@@ -448,16 +446,6 @@ contract KERIBackerZKTest is KERIBackerTestBase {
     // =========================================================================
     // Rejection tests
     // =========================================================================
-
-    function test_anchorWithZKProof_rejectsWrongPubkey() public {
-        bytes32 wrongPubkey = keccak256("wrong_pubkey");
-        bytes32 msgHash = keccak256(abi.encode(prefix1, uint64(0), said1));
-        bytes memory publicValues = abi.encode(wrongPubkey, msgHash);
-        bytes memory proof = abi.encode(publicValues, bytes(""));
-
-        vm.expectRevert("SP1KERIVerifier: backer not approved");
-        kb.anchorEvent(prefix1, 0, said1, address(sp1KeriVerifier), proof);
-    }
 
     function test_anchorWithZKProof_rejectsWrongMessage() public {
         bytes32 wrongMsgHash = keccak256("wrong_message");

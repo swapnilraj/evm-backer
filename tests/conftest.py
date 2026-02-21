@@ -216,10 +216,9 @@ def deployed_contract(w3):
 
     Deployment order:
       1. forge build (compile all contracts)
-      2. Deploy Ed25519Verifier(deployer_address)
-      3. approveBacker(ED25519_PUBKEY) on Ed25519Verifier
-      4. Deploy KERIBacker(deployer_address)
-      5. approveVerifier(ed25519_verifier_address) on KERIBacker
+      2. Deploy Ed25519Verifier() — permissionless, no approved-pubkeys list
+      3. Deploy KERIBacker(deployer_address)
+      4. approveVerifier(ed25519_verifier_address) on KERIBacker
 
     Returns a dict with:
         - address: the deployed KERIBacker address
@@ -238,17 +237,10 @@ def deployed_contract(w3):
             f"stderr: {compile_result.stderr}"
         )
 
-    # Deploy Ed25519Verifier with deployer as owner
+    # Deploy permissionless Ed25519Verifier (no constructor args, no approved-pubkeys list)
     ed25519_verifier_address = _forge_create(
         "src/Ed25519Verifier.sol:Ed25519Verifier",
-        ANVIL_DEPLOYER_ADDRESS,
     )
-
-    # Approve the test Ed25519 pubkey
-    ed25519_verifier_abi = _load_abi("Ed25519Verifier")
-    pubkey_bytes32 = bytes.fromhex(ED25519_PUBKEY_HEX)
-    _call_contract(w3, ed25519_verifier_address, ed25519_verifier_abi,
-                   "approveBacker", pubkey_bytes32)
 
     # Deploy KERIBacker with deployer as owner
     kb_address = _forge_create(
@@ -429,26 +421,18 @@ def contract_with_zk(w3, mock_sp1_verifier):
     """Deploy SP1KERIVerifier + a fresh KERIBacker for ZK path tests.
 
     Deployment order:
-      1. Deploy SP1KERIVerifier(mock_sp1_addr, bytes32(0), deployer_addr)
-      2. approveBacker(ED25519_PUBKEY) on SP1KERIVerifier
-      3. Deploy fresh KERIBacker(deployer_addr)
-      4. approveVerifier(sp1_keri_verifier_addr) on KERIBacker
+      1. Deploy SP1KERIVerifier(mock_sp1_addr, bytes32(0)) — permissionless
+      2. Deploy fresh KERIBacker(deployer_addr)
+      3. approveVerifier(sp1_keri_verifier_addr) on KERIBacker
 
     Returns a dict with 'address', 'abi', 'contract', 'sp1_keri_verifier_address'.
     """
-    # Deploy SP1KERIVerifier with deployer as owner, bytes32(0) vkey (MockVerifier ignores it)
+    # Deploy permissionless SP1KERIVerifier (2 args: sp1Verifier, vkey)
     sp1_keri_verifier_address = _forge_create(
         "src/SP1KERIVerifier.sol:SP1KERIVerifier",
         mock_sp1_verifier,
         "0x0000000000000000000000000000000000000000000000000000000000000000",
-        ANVIL_DEPLOYER_ADDRESS,
     )
-
-    # Approve the test Ed25519 pubkey on the SP1KERIVerifier
-    sp1_keri_verifier_abi = _load_abi("SP1KERIVerifier")
-    pubkey_bytes32 = bytes.fromhex(ED25519_PUBKEY_HEX)
-    _call_contract(w3, sp1_keri_verifier_address, sp1_keri_verifier_abi,
-                   "approveBacker", pubkey_bytes32)
 
     # Deploy fresh KERIBacker for ZK tests (separate from the one in deployed_contract)
     kb_address = _forge_create(

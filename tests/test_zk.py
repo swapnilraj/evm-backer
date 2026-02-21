@@ -107,23 +107,18 @@ class TestZKAnchorBatch:
 class TestZKRejections:
     """ZK proof path rejects malformed or unauthorised inputs."""
 
-    def test_zk_rejects_wrong_pubkey_in_public_values(
+    def test_zk_rejects_wrong_message_in_public_values(
         self, w3, contract_with_zk, backer_account
     ):
+        """Public values carry a different messageHash than the one the contract computed."""
         contract = contract_with_zk["contract"]
         sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
-        prefix_b32 = Web3.keccak(text="zk_wrong_pk_prefix")
+        prefix_b32 = Web3.keccak(text="zk_wrong_msg_prefix")
         sn = 0
-        said_b32 = Web3.keccak(text="zk_wrong_pk_said")
+        said_b32 = Web3.keccak(text="zk_wrong_msg_said")
 
-        encoded = w3.codec.encode(
-            ["bytes32", "uint64", "bytes32"],
-            [prefix_b32, sn, said_b32],
-        )
-        msg_hash = Web3.keccak(encoded)
-
-        wrong_pubkey = Web3.keccak(text="not_the_backer_key")
-        contract_proof, _ = make_mock_sp1_proof(wrong_pubkey, msg_hash)
+        wrong_msg_hash = Web3.keccak(text="totally_wrong_message")
+        contract_proof, _ = make_mock_sp1_proof(BACKER_PUBKEY_BYTES, wrong_msg_hash)
 
         tx = contract.functions.anchorEvent(
             prefix_b32, sn, said_b32, sp1_verifier, contract_proof
@@ -136,7 +131,7 @@ class TestZKRejections:
         signed = backer_account.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-        assert receipt.status == 0  # revert: SP1KERIVerifier: backer not approved
+        assert receipt.status == 0  # revert: SP1KERIVerifier: wrong message
 
     def test_zk_rejects_unapproved_verifier(
         self, w3, contract_with_zk, backer_account

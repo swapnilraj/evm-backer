@@ -248,35 +248,26 @@ class TestRealProverBinaryFast:
                 f"isAnchored({prefix.hex()}, {sn}, {said.hex()}) should return True"
             )
 
-    def test_wrong_pubkey_in_public_values_reverts(self, w3, contract_with_zk, backer_account, backer_signing_key):
-        """If public values carry an unapproved pubkey, anchorEvent (SP1 path) must revert.
+    def test_wrong_message_in_public_values_reverts(self, w3, contract_with_zk, backer_account, backer_signing_key):
+        """If public values carry a different messageHash, anchorEvent must revert.
 
-        The prover binary signs with a key that's not in SP1KERIVerifier.approvedBackers;
-        the verifier checks approvedBackers[pvPubKey] and reverts on mismatch.
+        The prover binary proves knowledge of a signature over the wrong message;
+        SP1KERIVerifier checks pvMsgHash == messageHash and reverts on mismatch.
         """
-        import nacl.signing
-
         contract = contract_with_zk["contract"]
         sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
-        prefix_b32 = Web3.keccak(text="rb_wrong_pk_prefix")
+        prefix_b32 = Web3.keccak(text="rb_wrong_msg_prefix")
         sn = 0
-        said_b32 = Web3.keccak(text="rb_wrong_pk_said")
+        said_b32 = Web3.keccak(text="rb_wrong_msg_said")
 
-        encoded = w3.codec.encode(
-            ["bytes32", "uint64", "bytes32"],
-            [prefix_b32, sn, said_b32],
-        )
-        msg_hash = Web3.keccak(encoded)
+        wrong_msg_hash = bytes(range(32))  # 32 deterministic bytes, not the real hash
 
-        # Use a different key — not approved in SP1KERIVerifier.approvedBackers
-        other_key = nacl.signing.SigningKey.generate()
-        other_pubkey = other_key.verify_key.encode()
-
+        pubkey_bytes = backer_signing_key.verify_key.encode()
         old_val = os.environ.get("SP1_PROVER")
         os.environ["SP1_PROVER"] = "mock"
         try:
             contract_proof, _, __ = generate_sp1_proof(
-                other_key, msg_hash, other_pubkey
+                backer_signing_key, wrong_msg_hash, pubkey_bytes
             )
         finally:
             if old_val is None:
@@ -296,7 +287,7 @@ class TestRealProverBinaryFast:
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
         assert receipt.status == 0, (
-            "anchorEvent should revert when public values carry an unapproved pubkey"
+            "anchorEvent should revert when public values carry a wrong message hash"
         )
 
 
@@ -364,7 +355,7 @@ class TestRealGroth16Proof:
             "lib/sp1-contracts/contracts/src/v6.0.0/SP1VerifierGroth16.sol:SP1Verifier",
         )
 
-        # Deploy SP1KERIVerifier with the real Groth16 verifier and real vkey
+        # Deploy permissionless SP1KERIVerifier with the real Groth16 verifier and real vkey
         sp1_vkey_bytes = bytes.fromhex(vkey.replace("0x", ""))
         sp1_keri_verifier_address = _deploy_contract(
             CONTRACTS_DIR,
@@ -373,20 +364,10 @@ class TestRealGroth16Proof:
             "src/SP1KERIVerifier.sol:SP1KERIVerifier",
             sp1_verifier_address,
             "0x" + sp1_vkey_bytes.hex(),
-            ANVIL_DEPLOYER_ADDRESS,
-        )
-        sp1_keri_abi = _load_abi(CONTRACTS_DIR, "SP1KERIVerifier")
-        sp1_keri_contract = w3.eth.contract(address=sp1_keri_verifier_address, abi=sp1_keri_abi)
-
-        # Approve the test backer pubkey on SP1KERIVerifier
-        deployer = Account.from_key(ANVIL_DEPLOYER_KEY)
-        _build_and_send(
-            w3, deployer,
-            sp1_keri_contract.functions.approveBacker(BACKER_PUBKEY_BYTES),
-            gas=500_000,
         )
 
         # Deploy fresh KERIBacker and approve the SP1KERIVerifier
+        deployer = Account.from_key(ANVIL_DEPLOYER_KEY)
         kb_address = _deploy_contract(
             CONTRACTS_DIR,
             ANVIL_RPC_URL,
