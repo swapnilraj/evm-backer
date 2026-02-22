@@ -300,18 +300,11 @@ pub fn run_kel_verification(input: &KelInput) -> [u8; 32] {
             }
             4 => {
                 // drt: delegated rotation — like rot but verifies delegation seal.
+                // Note: unlike dip, drt events do NOT include a 'di' field per the KERI spec.
+                // The delegation relationship was established by the dip event; subsequent drt
+                // events are tied to the delegating AID only through the approval seal.
                 let delegating_kel = input.delegating_kel.as_deref()
                     .unwrap_or_else(|| panic!("Event {i}: drt requires delegating_kel"));
-
-                // Verify the delegating AID is correct.
-                let event_json: serde_json::Value =
-                    serde_json::from_slice(&signing_bytes).expect("drt event: invalid JSON");
-                let di = event_json.get("di").and_then(|v| v.as_str())
-                    .unwrap_or_else(|| panic!("Event {i}: drt missing 'di' field"));
-                assert_eq!(
-                    di, delegating_kel.prefix_qb64,
-                    "Event {i}: drt di field mismatch"
-                );
 
                 // Verify the delegating KEL itself.
                 run_kel_verification(delegating_kel);
@@ -960,11 +953,10 @@ mod tests {
         let dip_said = blake3_hash(&dip_preimage);
         let dip_said_qb64 = digest_to_qb64(&dip_said);
 
-        // Build drt event.
+        // Build drt event. drt events do not include a 'di' field (unlike dip).
         let drt_preimage = format!(
-            "{{\"t\":\"drt\",\"d\":\"{}\",\"di\":\"{}\"}}",
+            "{{\"t\":\"drt\",\"d\":\"{}\"}}",
             "#".repeat(44),
-            delegating_qb64
         )
         .into_bytes();
         let drt_said = blake3_hash(&drt_preimage);

@@ -496,6 +496,9 @@ class TestDelegatedKEL:
     def _make_dip_drt_kel_store(self):
         """Build a delegated KEL store with dip + drt events.
 
+        drt events do not include a 'di' field per the KERI spec — the delegation
+        relationship is established by dip. Use rotate(..., ilk='drt') not delpre=.
+
         Returns (delegatee_pre, kel_store, drt_serder).
         """
         signer0 = Signer(raw=SEED_0, transferable=True)
@@ -509,10 +512,11 @@ class TestDelegatedKEL:
         delegating_pre = del_icp_serder.ked["i"]
         del_icp_sig = signer0.sign(ser=del_icp_serder.raw).raw
 
-        # Build delegatee dip (SEED_2 key, no pre-rotation for simplicity).
+        # Build delegatee dip (SEED_2 key), with pre-rotation commitment to signer1.
         keys2 = [signer2.verfer.qb64]
+        nxt_for_drt = [Diger(ser=signer1.verfer.qb64b).qb64]
         dip_serder = incept(
-            keys=keys2, ndigs=[], code=MtrDex.Blake3_256, delpre=delegating_pre
+            keys=keys2, ndigs=nxt_for_drt, code=MtrDex.Blake3_256, delpre=delegating_pre
         )
         delegatee_pre = dip_serder.ked["i"]
         dip_sig = signer2.sign(ser=dip_serder.raw).raw
@@ -526,8 +530,8 @@ class TestDelegatedKEL:
         )
         del_ixn1_sig = signer0.sign(ser=del_ixn1_serder.raw).raw
 
-        # Delegatee: drt (rotation). Since ndigs=[] in dip, we skip pre-rotation check.
-        # Use a new key (signer1) for the rotation.
+        # Delegatee drt: rotate from signer2 → signer1 (satisfies dip's pre-rotation).
+        # Use ilk='drt' — drt events have no 'di' field per the KERI spec.
         keys1 = [signer1.verfer.qb64]
         nxt2 = [Diger(ser=signer2.verfer.qb64b).qb64]
         drt_serder = rotate(
@@ -536,7 +540,7 @@ class TestDelegatedKEL:
             dig=dip_serder.said,
             ndigs=nxt2,
             sn=1,
-            delpre=delegating_pre,
+            ilk="drt",
         )
         drt_sig = signer2.sign(ser=drt_serder.raw).raw
 
@@ -593,10 +597,7 @@ class TestDelegatedKEL:
         contract = contract_with_zk["contract"]
         sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
 
-        try:
-            delegatee_pre, kel_store, drt_serder = self._make_dip_drt_kel_store()
-        except Exception as e:
-            pytest.skip(f"keripy drt not supported: {e}")
+        delegatee_pre, kel_store, drt_serder = self._make_dip_drt_kel_store()
 
         kel_input = build_kel_input(kel_store, delegatee_pre, target_sn=1)
 
