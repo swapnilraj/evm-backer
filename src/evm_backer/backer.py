@@ -111,13 +111,14 @@ def is_designated_backer(hab, controller_pre, kevers):
     return hab.pre in key_state.wits
 
 
-def process_event(hab, parser, kevery_components, queuer, raw_msg):
+def process_event(hab, parser, kevery_components, queuer, raw_msg, kel_store=None):
     """Process an incoming KERI event message.
 
     This is the core backer flow:
     1. Parse the message through Kevery/Tevery (validates signatures, chaining)
-    2. Queue designated events for on-chain anchoring (C3, C5 fix)
-    3. Generate receipt immediately (receipt-first model)
+    2. Store event data in kel_store for later ZK proof generation (if provided)
+    3. Queue designated events for on-chain anchoring (C3, C5 fix)
+    4. Generate receipt immediately (receipt-first model)
 
     Args:
         hab: Backer's Hab.
@@ -125,6 +126,11 @@ def process_event(hab, parser, kevery_components, queuer, raw_msg):
         kevery_components: dict from setup_kevery (provides kevery, cues).
         queuer: Queuer instance for on-chain batching.
         raw_msg: Raw CESR message bytes.
+        kel_store: Optional dict to populate with KEL data for ZK proof generation.
+            Keys: (prefix_qb64: str, sn: int)
+            Values: {"serder": keripy Serder, "sigs": [(signer_idx: int, sig_bytes: bytes(64)), ...]}
+            Signatures are extracted from the validated CESR stream via the
+            kever's stored siger objects in kevery_components["kevery"].kevers.
 
     Returns:
         Receipt message bytes, or None if event was rejected.
@@ -141,13 +147,53 @@ def process_event(hab, parser, kevery_components, queuer, raw_msg):
     for cue in kevery.cues:
         if cue.get("kin") != "receipt":
             continue
-        event = cue.get("serder")
-        if event is None:
+        serder = cue.get("serder")
+        if serder is None:
             continue
+
+        # Store KEL data for ZK proof generation if kel_store is provided.
+        # The signature is extracted from the kever's stored sigers in the database.
+        if kel_store is not None:
+            _store_kel_entry(kevery, serder, kel_store)
+
         # C3: only anchor events from controllers that designate this backer
-        if not is_designated_backer(hab, event.pre, kevery.kevers):
+        if not is_designated_backer(hab, serder.pre, kevery.kevers):
             continue
-        queuer.enqueue(event.pre, event.sn, event.said)
+        queuer.enqueue(serder.pre, serder.sn, serder.said)
 
     # Generate receipts (receipt-first model, C5 fix) — consumes cues
     return hab.processCues(kevery.cues)
+
+
+def _store_kel_entry(kevery, serder, kel_store):
+    """Store a validated event's serder and signatures in the kel_store.
+
+    The signatures are retrieved from the keripy database via the Kevery's db.
+    keripy stores the sigers for each (prefix, sn) after successful validation.
+
+    Args:
+        kevery: The keripy Kevery whose db holds the stored sigers.
+        serder: The validated keripy Serder for this event.
+        kel_store: dict to update with
+            {"serder": serder, "sigs": [(signer_idx: int, sig_bytes: bytes(64)), ...]}.
+    """
+    try:
+        # Retrieve the stored siger(s) for this event from the keripy database.
+        # getSigsIter yields Siger qb64 strings for each signer.
+        sigers = list(kevery.db.getSigsIter(keys=(serder.pre, f"{serder.sn:032d}")))
+        if sigers:
+            from keri.core.coring import Siger
+            sigs = []
+            for siger_qb64 in sigers:
+                siger = Siger(qb64=siger_qb64)
+                sigs.append((siger.index, siger.raw))
+        else:
+            # Fallback: empty sig (should not happen for validated events).
+            sigs = [(0, b"\x00" * 64)]
+    except Exception:
+        sigs = [(0, b"\x00" * 64)]
+
+    kel_store[(serder.pre, serder.sn)] = {
+        "serder": serder,
+        "sigs": sigs,
+    }

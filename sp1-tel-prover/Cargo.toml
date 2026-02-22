@@ -1,15 +1,16 @@
 [package]
-name = "sp1-prover"
-version = "0.1.0"
+name = "sp1-tel-prover"
+version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
-name = "sp1-prover"
+name = "sp1-tel-prover"
 path = "src/main.rs"
 
 [dependencies]
 sp1-sdk = { version = "6.0.0", features = ["blocking", "native-gnark"] }
-sp1-guest = { path = "../sp1-guest" }
+sp1-tel-guest = { path = "../sp1-tel-guest" }
 hex = "0.4"
 serde_json = "1"
 

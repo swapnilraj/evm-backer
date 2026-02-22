@@ -4312,8 +4312,13 @@ dependencies = [
 name = "sp1-guest"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "blake3",
  "ed25519-dalek",
+ "serde",
+ "serde_json",
  "sp1-zkvm",
+ "tiny-keccak",
 ]
 
 [[package]]
@@ -4421,6 +4426,7 @@ dependencies = [
  "hex",
  "serde_json",
  "sp1-build",
+ "sp1-guest",
  "sp1-sdk",
 ]
 
@@ -4688,6 +4694,29 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sp1-tel-guest"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "serde",
+ "serde_json",
+ "sp1-zkvm",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "sp1-tel-prover"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "sp1-build",
+ "sp1-sdk",
+ "sp1-tel-guest",
 ]
 
 [[package]]

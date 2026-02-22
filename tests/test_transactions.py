@@ -9,7 +9,7 @@ prefixes to assert exact ABI-encoded bytes.
 Raw CESR bytes are NOT included in the calldata (A1 fix): the contract stores
 only the SAID commitment. This reduces gas cost substantially.
 
-No mocks — uses real web3.py ABI encoding and real contract ABI.
+No mocks -- uses real web3.py ABI encoding and real contract ABI.
 
 Reference:
   - evm-backer-spec.md section 3 (Smart Contract)
@@ -84,7 +84,7 @@ KERI_BACKER_ABI = json.loads("""[
 
 # Dummy values for ABI encoding tests (no real contract interaction)
 DUMMY_VERIFIER = "0x0000000000000000000000000000000000000000"
-DUMMY_PROOF = b'\x00' * 96  # abi.encode(bytes32, bytes32, bytes32) = 3 * 32 bytes
+DUMMY_PROOF = b'\x00' * 96  # placeholder proof bytes
 
 
 
@@ -144,7 +144,7 @@ class TestSAIDEncoding:
 class TestAnchorEventCalldata:
     """Verify that anchorEvent calldata is correctly ABI-encoded.
 
-    anchorEvent(bytes32 prefix, uint64 sn, bytes32 eventSAID) — no raw bytes.
+    anchorEvent(bytes32 prefix, uint64 sn, bytes32 eventSAID) -- no raw bytes.
     """
 
     def test_anchor_event_encoding(self):
@@ -206,7 +206,7 @@ class TestAnchorEventCalldata:
 class TestAnchorBatchCalldata:
     """Verify that anchorBatch calldata correctly encodes multiple events.
 
-    Anchor struct: (bytes32 prefix, uint64 sn, bytes32 eventSAID) — no raw bytes.
+    Anchor struct: (bytes32 prefix, uint64 sn, bytes32 eventSAID) -- no raw bytes.
     """
 
     def test_batch_of_one_event(self):
@@ -309,7 +309,7 @@ class TestIsAnchoredCalldata:
 
         calldata = contract.encode_abi("isAnchored", args=[prefix_b32, sn, said_b32])
         assert calldata is not None
-        # isAnchored is a view function — calldata is used for eth_call
+        # isAnchored is a view function -- calldata is used for eth_call
         assert len(calldata) > 4
 
 
@@ -322,7 +322,7 @@ class TestGoldenCalldataFromKeriEvents:
         """Create a real inception event from the golden seed, then encode
         it as anchorEvent calldata. The calldata must be deterministic.
 
-        Only the SAID and prefix are encoded — no raw event bytes (A1 fix).
+        Only the SAID and prefix are encoded -- no raw event bytes (A1 fix).
         """
         signer = Signer(raw=SEED_0, transferable=False)
         keys = [signer.verfer.qb64]
@@ -369,22 +369,25 @@ class TestGoldenCalldataFromKeriEvents:
 
 
 class TestEIP1559FeeEstimation:
-    """Verify that build_anchor_tx produces EIP-1559 (type-2) transactions
-    with dynamic gas estimation when connected to a real EVM node.
+    """Verify that build_anchor_tx_with_sp1_proof produces EIP-1559 (type-2)
+    transactions with dynamic gas estimation when connected to a real EVM node.
 
     Uses the real anvil node from conftest fixtures.
     """
 
     def test_built_tx_has_eip1559_fields(
-        self, w3, contract, backer_account, backer_signing_key, ed25519_verifier_address
+        self, w3, contract_with_zk, backer_account
     ):
         """A built transaction must include maxFeePerGas and maxPriorityFeePerGas."""
         from evm_backer.transactions import (
-            build_anchor_tx,
+            build_anchor_tx_with_sp1_proof,
             prefix_to_bytes32,
             said_to_bytes32,
         )
-        from tests.conftest import ED25519_PUBKEY_HEX
+        from evm_backer.proofs import make_mock_sp1_proof
+
+        contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
 
         anchors = [
             (
@@ -393,11 +396,16 @@ class TestEIP1559FeeEstimation:
                 said_to_bytes32("EEIP1559TestSaid00000000000000000000000000000"),
             )
         ]
-        signed_tx = build_anchor_tx(
+        # Build mock ZK proof
+        encoded = w3.codec.encode(["(bytes32,uint64,bytes32)[]"], [anchors])
+        msg_hash = Web3.keccak(encoded)
+        _, public_values = make_mock_sp1_proof(msg_hash)
+
+        signed_tx = build_anchor_tx_with_sp1_proof(
             w3, contract, backer_account, anchors,
-            signing_key=backer_signing_key,
-            verifier_address=ed25519_verifier_address,
-            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+            public_values=public_values,
+            proof_bytes=b"",
+            verifier_address=sp1_verifier,
         )
 
         # The signed tx object should exist and be submittable
@@ -405,7 +413,7 @@ class TestEIP1559FeeEstimation:
         assert hasattr(signed_tx, "raw_transaction")
 
     def test_dynamic_gas_estimation_not_hardcoded(
-        self, w3, contract, backer_account, backer_signing_key, ed25519_verifier_address
+        self, w3, contract_with_zk, backer_account
     ):
         """Gas limit should be dynamically estimated, not always 500_000.
 
@@ -413,12 +421,15 @@ class TestEIP1559FeeEstimation:
         buffer, the estimated gas should be well below the old hardcoded value.
         """
         from evm_backer.transactions import (
-            build_anchor_tx,
+            build_anchor_tx_with_sp1_proof,
             prefix_to_bytes32,
             said_to_bytes32,
             FALLBACK_GAS_LIMIT,
         )
-        from tests.conftest import ED25519_PUBKEY_HEX
+        from evm_backer.proofs import make_mock_sp1_proof
+
+        contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
 
         anchors = [
             (
@@ -427,11 +438,15 @@ class TestEIP1559FeeEstimation:
                 said_to_bytes32("EGasDynamicTestSaid0000000000000000000000000"),
             )
         ]
-        signed_tx = build_anchor_tx(
+        encoded = w3.codec.encode(["(bytes32,uint64,bytes32)[]"], [anchors])
+        msg_hash = Web3.keccak(encoded)
+        _, public_values = make_mock_sp1_proof(msg_hash)
+
+        signed_tx = build_anchor_tx_with_sp1_proof(
             w3, contract, backer_account, anchors,
-            signing_key=backer_signing_key,
-            verifier_address=ed25519_verifier_address,
-            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+            public_values=public_values,
+            proof_bytes=b"",
+            verifier_address=sp1_verifier,
         )
 
         # Submit and check the receipt to see actual gas used
@@ -441,7 +456,7 @@ class TestEIP1559FeeEstimation:
         receipt = w3.eth.wait_for_transaction_receipt(bytes.fromhex(tx_hash[2:]))
         assert receipt.status == 1
 
-        # The gas used should be well below the old hardcoded 500k
+        # The gas used should be well below the fallback limit
         assert receipt.gasUsed < FALLBACK_GAS_LIMIT
 
     def test_eip1559_fee_estimation_function(self, w3):

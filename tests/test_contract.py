@@ -16,15 +16,14 @@ Reference:
   - contracts/test/KERIBacker.t.sol (behavioral coverage via Foundry)
 """
 
-from eth_abi import encode as abi_encode
+from web3 import Web3
+
 from keri.core import eventing
 from keri.core.signing import Signer
 
-from nacl.signing import SigningKey
-from web3 import Web3
-
+from evm_backer.proofs import make_mock_sp1_proof
 from evm_backer.transactions import prefix_to_bytes32, said_to_bytes32
-from tests.conftest import SEED_0, _send_anchor_tx, ED25519_SIGNING_KEY, ED25519_PUBKEY_HEX
+from tests.conftest import SEED_0, _send_anchor_tx_zk
 
 
 def _build_golden_icp():
@@ -35,25 +34,28 @@ def _build_golden_icp():
 
 
 class TestPythonStackIntegration:
-    """Prove the Python web3.py ↔ KERIBacker.sol stack works end-to-end.
+    """Prove the Python web3.py <-> KERIBacker.sol stack works end-to-end.
 
     Foundry covers all contract logic. These tests cover Python glue only.
     """
 
     def test_anchor_and_query_via_python_stack(
-        self, w3, contract, backer_account, ed25519_verifier_address
+        self, w3, contract_with_zk, backer_account
     ):
         """forge deploy + eth_account sign + web3.py view call.
 
         Proves the full stack: forge compiles, anvil runs, web3.py connects,
         eth_account signs, and isAnchored() returns the right answer.
         """
+        contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
+
         serder = _build_golden_icp()
         prefix_b32 = prefix_to_bytes32(serder.ked["i"])
         said_b32 = said_to_bytes32(serder.said)
 
-        receipt = _send_anchor_tx(
-            w3, contract, backer_account, prefix_b32, 0, said_b32, ed25519_verifier_address
+        receipt = _send_anchor_tx_zk(
+            w3, contract, backer_account, prefix_b32, 0, said_b32, sp1_verifier
         )
         assert receipt.status == 1
 
@@ -61,7 +63,7 @@ class TestPythonStackIntegration:
         assert contract.functions.isAnchored(prefix_b32, 0, b'\x00' * 32).call() is False
 
     def test_batch_tuple_encoding_and_log_parsing(
-        self, w3, contract, backer_account, ed25519_verifier_address
+        self, w3, contract_with_zk, backer_account
     ):
         """anchorBatch Anchor[] struct array via Python tuples + event log parsing.
 
@@ -69,6 +71,9 @@ class TestPythonStackIntegration:
           - web3.py encodes Python tuples as Solidity struct arrays correctly
           - contract.events.KERIEventAnchored().process_receipt() parses all logs
         """
+        contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
+
         anchors = [
             (b'\xd3' * 32, 0, b'\xe3' * 32),
             (b'\xd4' * 32, 0, b'\xe4' * 32),
@@ -76,18 +81,15 @@ class TestPythonStackIntegration:
         # Compute message hash: keccak256(abi.encode(anchors))
         encoded = w3.codec.encode(["(bytes32,uint64,bytes32)[]"], [anchors])
         msg_hash = Web3.keccak(encoded)
-        sig = ED25519_SIGNING_KEY.sign(msg_hash).signature  # 64 bytes: r || s
-        r, s = sig[:32], sig[32:]
-        pubkey_bytes = bytes.fromhex(ED25519_PUBKEY_HEX)
-        proof = abi_encode(["bytes32", "bytes32", "bytes32"], [pubkey_bytes, r, s])
+        contract_proof, _ = make_mock_sp1_proof(msg_hash)
 
         tx = contract.functions.anchorBatch(
-            anchors, ed25519_verifier_address, proof
+            anchors, sp1_verifier, contract_proof
         ).build_transaction({
             "from": backer_account.address,
             "nonce": w3.eth.get_transaction_count(backer_account.address, "pending"),
             "chainId": w3.eth.chain_id,
-            "gas": 1_000_000,
+            "gas": 500_000,
         })
         signed = backer_account.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -97,17 +99,18 @@ class TestPythonStackIntegration:
         logs = contract.events.KERIEventAnchored().process_receipt(receipt)
         assert len(logs) == 2, "Each anchor in the batch must emit KERIEventAnchored"
 
-    def test_revert_detection(self, w3, contract, deployer_account):
-        """Unapproved verifier — tx is mined but receipt.status == 0.
+    def test_revert_detection(self, w3, contract_with_zk, deployer_account):
+        """Unapproved verifier -- tx is mined but receipt.status == 0.
 
         Proves web3.py correctly surfaces failed txs: send_raw_transaction
         succeeds (tx enters mempool), but the mined receipt has status 0.
         """
+        contract = contract_with_zk["contract"]
         unregistered_verifier = "0x0000000000000000000000000000000000000000"
         tx = contract.functions.anchorEvent(
             b'\xf0' * 32, 0, b'\xf1' * 32,
             unregistered_verifier,
-            b'',  # proof doesn't matter — verifier check fails first
+            b'',  # proof doesn't matter -- verifier check fails first
         ).build_transaction({
             "from": deployer_account.address,
             "nonce": w3.eth.get_transaction_count(deployer_account.address, "pending"),

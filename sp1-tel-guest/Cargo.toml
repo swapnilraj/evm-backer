@@ -1,19 +1,19 @@
 [package]
-name = "sp1-guest"
-version = "0.1.0"
+name = "sp1-tel-guest"
+version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [lib]
-name = "sp1_guest"
+name = "sp1_tel_guest"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sp1-guest"
+name = "sp1-tel-guest-bin"
 path = "src/main.rs"
 
 [dependencies]
 sp1-zkvm = { version = "6.0.0" }
-ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc"] }
 blake3 = { version = "1", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 tiny-keccak = { version = "2", features = ["keccak"] }

@@ -1,9 +1,9 @@
-//! SP1 prover CLI: generate a ZK proof that a KERI Key Event Log is valid.
+//! SP1 TEL prover CLI: generate a ZK proof that a KERI TEL event is valid.
 //!
-//! Usage: sp1-prover <kel_input_hex>
+//! Usage: sp1-tel-prover <tel_input_hex>
 //!
-//!   <kel_input_hex>  hex-encoded JSON of a KelInput struct.
-//!                    Build this with evm_backer.proofs.build_kel_input() in Python.
+//!   <tel_input_hex>  hex-encoded JSON of a TelInput struct.
+//!                    Build this with evm_backer.proofs.build_tel_input() in Python.
 //!
 //! Outputs JSON to stdout:
 //!   {
@@ -11,36 +11,30 @@
 //!     "publicValues": "<hex>",
 //!     "vkey": "<hex>"
 //!   }
-//!
-//! Environment variables:
-//!   SP1_PROVER=cpu     — real local STARK proving then Groth16 wrap (~7 min)
-//!   SP1_PROVER=mock    — mock proving (instant; guest ELF still runs for public values)
-//!   SP1_PROVER=network — Succinct's remote proving network
 
-use sp1_guest::KelInput;
+use sp1_tel_guest::TelInput;
 use sp1_sdk::{
     blocking::{ProveRequest, Prover, ProverClient},
     include_elf, Elf, HashableKey, ProvingKey, SP1Stdin,
 };
 
-/// The ELF binary of the sp1-guest program, embedded at compile time.
-const GUEST_ELF: Elf = include_elf!("sp1-guest");
+const GUEST_ELF: Elf = include_elf!("sp1-tel-guest-bin");
 
 fn main() {
     sp1_sdk::utils::setup_logger();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: sp1-prover <kel_input_hex>");
-        eprintln!("  <kel_input_hex>  hex-encoded JSON of a KelInput struct");
+        eprintln!("Usage: sp1-tel-prover <tel_input_hex>");
+        eprintln!("  <tel_input_hex>  hex-encoded JSON of a TelInput struct");
         std::process::exit(1);
     }
 
     let json_bytes = hex::decode(&args[1]).expect("invalid hex argument");
-    let kel_input: KelInput = serde_json::from_slice(&json_bytes).expect("invalid JSON KelInput");
+    let tel_input: TelInput = serde_json::from_slice(&json_bytes).expect("invalid JSON TelInput");
 
     let mut stdin = SP1Stdin::new();
-    stdin.write(&kel_input);
+    stdin.write(&tel_input);
 
     let client = ProverClient::from_env();
     let pk = client.setup(GUEST_ELF).expect("failed to setup ELF");

@@ -1,5 +1,5 @@
 [workspace]
-members = ["sp1-guest", "sp1-prover"]
+members = ["sp1-guest", "sp1-prover", "sp1-tel-guest", "sp1-tel-prover"]
 resolver = "2"
 
 [workspace.package]

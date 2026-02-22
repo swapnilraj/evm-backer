@@ -14,10 +14,12 @@ Reference:
 import threading
 import time
 
+from web3 import Web3
+
 from evm_backer.transactions import (
     prefix_to_bytes32,
     said_to_bytes32,
-    build_anchor_tx,
+    build_anchor_tx_with_sp1_proof,
     submit_anchor_tx,
 )
 
@@ -30,19 +32,30 @@ class Queuer:
 
     Events are queued as (prefix_qb64, sn, said_qb64) tuples. Every
     QUEUE_DURATION seconds (or when MAX_BATCH_SIZE is reached), the
-    queued events are encoded and submitted as an anchorBatch transaction.
+    queued events are encoded and submitted as an anchorBatch transaction
+    with an SP1 ZK proof.
     """
 
     def __init__(
-        self, w3, contract, backer_account, signing_key=None,
-        verifier_address=None, backer_pubkey_bytes=None
+        self, w3, contract, backer_account,
+        verifier_address=None, proof_builder=None
     ):
+        """Initialize the Queuer.
+
+        Args:
+            w3: Web3 instance.
+            contract: web3.py Contract instance for KERIBacker.
+            backer_account: eth_account.Account for gas payment.
+            verifier_address: Address of the approved SP1KERIVerifier contract.
+            proof_builder: Callable that takes a list of (prefix_b32, sn, said_b32)
+                anchors and returns (public_values, proof_bytes). In production
+                this calls generate_sp1_proof; in tests this calls make_mock_sp1_proof.
+        """
         self.w3 = w3
         self.contract = contract
         self.backer_account = backer_account
-        self.signing_key = signing_key
         self.verifier_address = verifier_address
-        self.backer_pubkey_bytes = backer_pubkey_bytes
+        self.proof_builder = proof_builder
         self._queue = []
         self._lock = threading.Lock()
         self._pending_txs = []  # list of (tx_hash, anchors) for crawler
@@ -75,11 +88,14 @@ class Queuer:
             for prefix, sn, said in batch
         ]
 
-        signed_tx = build_anchor_tx(
+        # Build the ZK proof for this batch
+        public_values, proof_bytes = self.proof_builder(anchors)
+
+        signed_tx = build_anchor_tx_with_sp1_proof(
             self.w3, self.contract, self.backer_account, anchors,
-            signing_key=self.signing_key,
+            public_values=public_values,
+            proof_bytes=proof_bytes,
             verifier_address=self.verifier_address,
-            backer_pubkey_bytes=self.backer_pubkey_bytes,
         )
         tx_hash = submit_anchor_tx(self.w3, signed_tx)
 

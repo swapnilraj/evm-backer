@@ -5,26 +5,25 @@ EVM Backer ZK Integration Tests
 Tests for the SP1 ZK proof path via SP1KERIVerifier + SP1MockVerifier.
 All tests use make_mock_sp1_proof() — no real SP1 toolchain required.
 
-The unified anchorEvent/anchorBatch interface is used with the SP1KERIVerifier
-address and abi.encode(publicValues, b"") as the proof.
+The SP1 guest now proves the full KERI KEL. Public values are 32 bytes:
+    abi.encode(bytes32 messageHash)
 
-Fixtures contract_with_zk and mock_sp1_verifier are session-scoped and defined
-in conftest.py.
+(Previously 64 bytes with backerPubKey; the KEL proof makes an
+approvedBackers whitelist unnecessary.)
+
+Fixtures contract_with_zk and mock_sp1_verifier are session-scoped and
+defined in conftest.py.
 """
 
 import pytest
 from web3 import Web3
 
-from tests.conftest import ED25519_PUBKEY_HEX
 from evm_backer.proofs import make_mock_sp1_proof
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-BACKER_PUBKEY_BYTES = bytes.fromhex(ED25519_PUBKEY_HEX)
-
 
 def _build_and_send(w3, contract_fn, backer_account):
     """Build, sign and send a contract transaction; return the receipt."""
@@ -61,7 +60,7 @@ class TestZKAnchorSingleEvent:
             [prefix_b32, sn, said_b32],
         )
         msg_hash = Web3.keccak(encoded)
-        contract_proof, _ = make_mock_sp1_proof(BACKER_PUBKEY_BYTES, msg_hash)
+        contract_proof, _ = make_mock_sp1_proof(msg_hash)
 
         receipt = _build_and_send(
             w3,
@@ -91,7 +90,7 @@ class TestZKAnchorBatch:
 
         encoded = w3.codec.encode(["(bytes32,uint64,bytes32)[]"], [anchors])
         msg_hash = Web3.keccak(encoded)
-        contract_proof, _ = make_mock_sp1_proof(BACKER_PUBKEY_BYTES, msg_hash)
+        contract_proof, _ = make_mock_sp1_proof(msg_hash)
 
         receipt = _build_and_send(
             w3,
@@ -110,7 +109,7 @@ class TestZKRejections:
     def test_zk_rejects_wrong_message_in_public_values(
         self, w3, contract_with_zk, backer_account
     ):
-        """Public values carry a different messageHash than the one the contract computed."""
+        """Public values carry a different messageHash than what the contract computed."""
         contract = contract_with_zk["contract"]
         sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
         prefix_b32 = Web3.keccak(text="zk_wrong_msg_prefix")
@@ -118,7 +117,7 @@ class TestZKRejections:
         said_b32 = Web3.keccak(text="zk_wrong_msg_said")
 
         wrong_msg_hash = Web3.keccak(text="totally_wrong_message")
-        contract_proof, _ = make_mock_sp1_proof(BACKER_PUBKEY_BYTES, wrong_msg_hash)
+        contract_proof, _ = make_mock_sp1_proof(wrong_msg_hash)
 
         tx = contract.functions.anchorEvent(
             prefix_b32, sn, said_b32, sp1_verifier, contract_proof
@@ -148,7 +147,7 @@ class TestZKRejections:
             [prefix_b32, sn, said_b32],
         )
         msg_hash = Web3.keccak(encoded)
-        contract_proof, _ = make_mock_sp1_proof(BACKER_PUBKEY_BYTES, msg_hash)
+        contract_proof, _ = make_mock_sp1_proof(msg_hash)
 
         tx = contract.functions.anchorEvent(
             prefix_b32, sn, said_b32, unregistered, contract_proof

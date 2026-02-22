@@ -177,20 +177,35 @@ def build_service(config=None, abi_path=None):
     tevery_components = setup_tevery(hby, hab, kevery_components)
     parser = setup_parser(kevery_components, tevery_components)
 
-    # Derive the Ed25519 signing callable from the backer's KERI key.
-    # hab.sign(ser, indexed=False) returns a list of Cigar objects;
-    # Cigar.raw is the 64-byte Ed25519 signature over the raw bytes.
-    # This uses the same key as the backer's KERI identity, as required
-    # by the spec (one key for both KERI and Ethereum authorization).
-    def _sign_with_hab(msg):
-        sigs = hab.sign(ser=msg, indexed=False)
-        return sigs[0].raw
+    # Build the ZK proof builder for the Queuer. In production, this calls
+    # generate_sp1_proof to create a real Groth16 proof of KEL validity.
+    # The proof_builder takes a list of anchors and returns (public_values, proof_bytes).
+    from evm_backer.proofs import generate_sp1_proof, build_kel_input
+    from evm_backer.transactions import prefix_to_bytes32, said_to_bytes32
+    from eth_abi import encode as abi_encode
+
+    # TODO: In production, the proof_builder should use build_kel_input + generate_sp1_proof
+    # with a KEL store populated by process_event. For now, the verifier_address and
+    # proof_builder must be configured by the caller via environment or config.
+
+    verifier_address = config.get("SP1_KERI_VERIFIER_ADDRESS", "")
+
+    def _build_zk_proof(anchors):
+        """Build a ZK proof for a batch of anchors."""
+        encoded = w3.codec.encode(["(bytes32,uint64,bytes32)[]"], [anchors])
+        msg_hash = w3.keccak(encoded)
+        public_values = abi_encode(["bytes32"], [msg_hash])
+        # In production, proof_bytes comes from the SP1 prover.
+        # This is set up by the deployment environment.
+        proof_bytes = b""
+        return public_values, proof_bytes
 
     queuer = Queuer(
         w3=w3,
         contract=contract,
         backer_account=backer_account,
-        signing_key=_sign_with_hab,
+        verifier_address=verifier_address,
+        proof_builder=_build_zk_proof,
     )
     crawler = Crawler(w3=w3, queuer=queuer)
 

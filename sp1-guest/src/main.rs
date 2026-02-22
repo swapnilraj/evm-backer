@@ -1,33 +1,19 @@
-//! SP1 guest program: verify an Ed25519 signature and commit to (pubkey, messageHash).
+//! SP1 guest program: verify a full KERI Key Event Log (KEL) and commit to
+//! the 32-byte messageHash of the final event.
 //!
-//! Private inputs (via sp1_zkvm::io::read):
-//!   - backer_pubkey: [u8; 32]  — Ed25519 verifying key bytes
-//!   - message_hash:  [u8; 32]  — the 32-byte keccak256 message hash
-//!   - signature:     [u8; 64]  — Ed25519 signature (r || s)
+//! Private input: KelInput (bincode-serialized, written by sp1-prover via stdin.write)
+//! Public output: 32 bytes = keccak256(abi.encode(prefix_b32, sn, said_b32))
 //!
-//! Public outputs (committed via sp1_zkvm::io::commit_slice):
-//!   64 bytes = backer_pubkey (32) || message_hash (32)
-//!   Matches abi.encode(bytes32 backerPubKey, bytes32 messageHash) in Solidity.
+//! The verification logic lives in lib.rs (run_kel_verification) so it can be
+//! unit-tested natively.  Only the zkVM I/O lives here.
 
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use ed25519_dalek::{Signature, VerifyingKey};
+use sp1_guest::{run_kel_verification, KelInput};
 
 pub fn main() {
-    let pubkey_bytes: [u8; 32] = sp1_zkvm::io::read();
-    let message: [u8; 32] = sp1_zkvm::io::read();
-    // Read signature as two [u8; 32] halves because serde doesn't support [u8; 64].
-    let sig_r: [u8; 32] = sp1_zkvm::io::read();
-    let sig_s: [u8; 32] = sp1_zkvm::io::read();
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes[..32].copy_from_slice(&sig_r);
-    sig_bytes[32..].copy_from_slice(&sig_s);
-
-    let vk = VerifyingKey::from_bytes(&pubkey_bytes).expect("invalid pubkey");
-    let sig = Signature::from_bytes(&sig_bytes);
-    vk.verify_strict(&message, &sig).expect("invalid signature");
-
-    sp1_zkvm::io::commit_slice(&pubkey_bytes);
-    sp1_zkvm::io::commit_slice(&message);
+    let input: KelInput = sp1_zkvm::io::read();
+    let message_hash = run_kel_verification(&input);
+    sp1_zkvm::io::commit_slice(&message_hash);
 }

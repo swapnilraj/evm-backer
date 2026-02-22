@@ -15,14 +15,15 @@ import time
 
 import falcon.testing
 import pytest
+from web3 import Web3
 
 from evm_backer.backer import setup_kevery, setup_parser, setup_tevery
 from evm_backer.crawler import Crawler
 from evm_backer.event_queue import Queuer
 from evm_backer.http_server import create_app
+from evm_backer.proofs import make_mock_sp1_proof
 from evm_backer.service import ServiceLoop
 from evm_backer.transactions import prefix_to_bytes32, said_to_bytes32
-from tests.conftest import ED25519_SIGNING_KEY, ED25519_PUBKEY_HEX
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,20 @@ class StubQueuer:
 
     def requeue(self, events):
         self.enqueued.extend(events)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_mock_proof_builder(w3):
+    """Return a proof_builder callable for the Queuer that uses mock SP1 proofs."""
+    def _build_proof(anchors):
+        encoded = w3.codec.encode(["(bytes32,uint64,bytes32)[]"], [anchors])
+        msg_hash = Web3.keccak(encoded)
+        _, public_values = make_mock_sp1_proof(msg_hash)
+        return public_values, b""
+    return _build_proof
 
 
 # ---------------------------------------------------------------------------
@@ -164,14 +179,16 @@ class TestFlushLoop:
     """Test that the service loop flushes the queue to chain."""
 
     def test_flush_submits_queued_event(
-        self, w3, contract, backer_account, keri_habery, backer_hab, ed25519_verifier_address
+        self, w3, contract_with_zk, backer_account, keri_habery, backer_hab
     ):
         """Enqueue an event, then _tick() flushes and submits it to chain."""
+        contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
+
         queuer = Queuer(
             w3=w3, contract=contract, backer_account=backer_account,
-            signing_key=ED25519_SIGNING_KEY,
-            verifier_address=ed25519_verifier_address,
-            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+            verifier_address=sp1_verifier,
+            proof_builder=_make_mock_proof_builder(w3),
         )
         crawler = Crawler(w3=w3, queuer=queuer)
 
@@ -215,17 +232,19 @@ class TestFlushLoop:
 class TestFullServicePipeline:
     """Test the full pipeline from enqueue through flush to on-chain verification."""
 
-    def test_enqueue_flush_verify(self, w3, contract, backer_account, ed25519_verifier_address):
+    def test_enqueue_flush_verify(self, w3, contract_with_zk, backer_account):
         """Direct enqueue + flush + on-chain verification (no HTTP involved)."""
+        contract = contract_with_zk["contract"]
+        sp1_verifier = contract_with_zk["sp1_keri_verifier_address"]
+
         prefix_qb64 = "BServicePipelineTest00000000000000000000000"
         said_qb64 = "EServicePipelineTestSaid0000000000000000000"
         sn = 0
 
         queuer = Queuer(
             w3=w3, contract=contract, backer_account=backer_account,
-            signing_key=ED25519_SIGNING_KEY,
-            verifier_address=ed25519_verifier_address,
-            backer_pubkey_bytes=bytes.fromhex(ED25519_PUBKEY_HEX),
+            verifier_address=sp1_verifier,
+            proof_builder=_make_mock_proof_builder(w3),
         )
         queuer.enqueue(prefix_qb64, sn, said_qb64)
         tx_hash = queuer.flush()

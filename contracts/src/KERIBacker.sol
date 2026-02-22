@@ -8,9 +8,8 @@ import "./IKERIVerifier.sol";
 ///
 /// Deployed once by GLEIF (or equivalent root authority) and shared by all QVIs.
 /// Verification is fully delegated to modular verifier contracts registered by
-/// the owner. Ed25519 on-chain verification and SP1 ZK proofs are both supported
-/// via separate verifier deployments; new verification methods can be added
-/// without touching this contract.
+/// the owner. SP1 ZK proofs verify the complete KERI KEL inside a zkVM; new
+/// verification methods can be added without touching this contract.
 ///
 /// Any caller may submit an anchor so long as they supply a proof that passes
 /// an approved verifier. There is no per-backer setup — GLEIF approves new QVI
@@ -125,7 +124,7 @@ contract KERIBacker {
     /// @param  sn         Event sequence number
     /// @param  eventSAID  SAID of the event being anchored
     /// @param  verifier   Approved IKERIVerifier contract that validates proof
-    /// @param  proof      Verifier-specific bytes (Ed25519 sig, ZK proof, etc.)
+    /// @param  proof      Verifier-specific bytes (ZK proof, etc.)
     function anchorEvent(
         bytes32        prefix,
         uint64         sn,
