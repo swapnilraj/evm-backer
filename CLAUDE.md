@@ -61,11 +61,6 @@ cargo build --release -p sp1-prover -p sp1-tel-prover
 - **TEL anchoring**: `SP1TELVerifier` verifies a ZK proof that a TEL event's SAID is correct and its anchor seal appears in a controller KEL event, then checks that event is already on-chain via `KERIBacker.isAnchored()`.
 - **Prefix/SAID encoding**: `keccak256(qb64_string)` → `bytes32` for both AID prefix and SAID. Collision-resistant, handles arbitrary-length identifiers unambiguously.
 
-## Open questions (resolve with KERI community before finalising)
-
-See `evm-backer-spec.md` §10 for the full list. One that affects implementation:
-- Whether keripy's validator handles mixed witness + ledger backer sets in the `b` field
-
 ## Background reading
 
 - `evm-backer-spec.md` — full technical specification
